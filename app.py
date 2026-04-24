@@ -927,15 +927,20 @@ def resolve_field_value(token, field_info, raw_value, ref_cache):
 
         items = ref_cache[ref_col]
 
+        def _norm(s):
+            s = str(s).strip().lower()
+            return re.sub(r'[^a-z0-9]+', '-', s).strip('-')
+
         def find_item(lookup):
-            lookup = str(lookup).strip().lower()
+            want = _norm(lookup)
             for i in items:
                 fd = i.get("fieldData", {})
-                name = str(fd.get("name", "")).strip().lower()
-                slug_v = str(fd.get("slug", "")).strip().lower()
-                if (slug_v == lookup or name == lookup
-                        or name.replace(" ", "-") == lookup
-                        or str(i.get("id", "")) == lookup):
+                candidates = {
+                    _norm(fd.get("slug", "")),
+                    _norm(fd.get("name", "")),
+                    str(i.get("id", "")).strip().lower(),
+                }
+                if want in candidates:
                     return i
             return None
 
@@ -955,7 +960,13 @@ def resolve_field_value(token, field_info, raw_value, ref_cache):
         hit = find_item(raw_value)
         if hit:
             return hit["id"], None
-        return raw_value, f"Reference value '{raw_value}' not found in collection {ref_col}"
+        available = ", ".join(
+            str(i.get("fieldData", {}).get("slug", "?")) for i in items[:10]
+        )
+        return None, (
+            f"Reference value '{raw_value}' not found in collection {ref_col}. "
+            f"Available slugs: {available}{'…' if len(items) > 10 else ''}"
+        )
 
     return raw_value, None
 
@@ -1224,12 +1235,40 @@ if mode == "Push CMS Fields (.md)":
 
         # Diagnostic: show schema field types so reference fields can be identified
         with st.expander("🔎 Schema Inspector (field types)"):
+            rows = []
             for fslug, finfo in field_map.items():
                 ftype = finfo.get("type", "?")
                 validations = finfo.get("validations", {}) or {}
                 ref_col = validations.get("collectionId")
                 extra = f" → ref collection `{ref_col}`" if ref_col else ""
                 st.caption(f"`{fslug}` — **{ftype}**{extra}")
+                rows.append({"slug": fslug, "type": ftype, "refCollectionId": ref_col or ""})
+            st.download_button(
+                "📥 Download schema as JSON",
+                data=json.dumps(schema["fields"], indent=2),
+                file_name="webflow_collection_schema.json",
+                mime="application/json",
+            )
+
+        # Diagnostic: show the referenced-collection items we could load for lookup
+        ref_collection_ids = {
+            (finfo.get("validations") or {}).get("collectionId")
+            for finfo in field_map.values()
+            if (finfo.get("validations") or {}).get("collectionId")
+        }
+        if ref_collection_ids:
+            with st.expander(f"🔗 Referenced Collections ({len(ref_collection_ids)}) — values you can use"):
+                for rc in ref_collection_ids:
+                    items, err = list_reference_options(api_token, rc)
+                    if err:
+                        st.error(f"`{rc}` — could not load: {err}")
+                        continue
+                    st.markdown(f"**`{rc}`** — {len(items)} items")
+                    sample = []
+                    for i in items[:25]:
+                        fd = i.get("fieldData", {})
+                        sample.append(f"`{fd.get('slug', '?')}` — {fd.get('name', '?')}")
+                    st.caption(" · ".join(sample) + ("…" if len(items) > 25 else ""))
 
         def best_match_slug(parsed_slug):
             if parsed_slug in schema_slugs:
@@ -1265,6 +1304,10 @@ if mode == "Push CMS Fields (.md)":
             resolved, warn = resolve_field_value(api_token, field_map[real_slug], value, ref_cache)
             if warn:
                 warnings_list.append(f"`{real_slug}`: {warn}")
+            if resolved is None:
+                # Skip unresolved reference/option values instead of pushing a bad value
+                skipped.append(real_slug)
+                continue
             field_data[real_slug] = resolved
 
         # Field preview with schema alignment
