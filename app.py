@@ -871,6 +871,64 @@ def create_new_item(token, name, slug, content_html, collection_id, extra_fields
     return resp
 
 
+# ─── CMS FIELDS MD HELPERS ────────────────────────────────────────────────────
+
+def field_name_to_slug(name):
+    slug = name.lower().strip()
+    slug = re.sub(r'\s*\(.*?\)', '', slug)       # drop (parenthetical)
+    slug = re.sub(r'[^a-z0-9\s-]', '', slug)     # remove special chars
+    slug = re.sub(r'\s+', '-', slug.strip())      # spaces → hyphens
+    return re.sub(r'-+', '-', slug).strip('-')
+
+
+def rich_text_bullets_to_html(text):
+    text = re.sub(r'^Bullet list[-;:\s]+', '', text, flags=re.IGNORECASE).strip()
+    items = [i.strip() for i in text.split(';') if i.strip()]
+    if not items:
+        return f'<p>{text}</p>'
+    return '<ul>' + ''.join(f'<li>{item}</li>' for item in items) + '</ul>'
+
+
+def parse_cms_fields_md(md_content):
+    """Parse a CMS fields markdown table into {webflow_slug: (value, input_type)}."""
+    fields = {}
+    separator_seen = False
+
+    for line in md_content.split('\n'):
+        stripped = line.strip()
+        if not stripped.startswith('|'):
+            continue
+        # Separator row: |---|---|...|
+        if re.match(r'^\|[-|\s:=]+\|$', stripped):
+            separator_seen = True
+            continue
+        if not separator_seen:
+            continue  # skip header row
+
+        parts = stripped.split('|')
+        if len(parts) < 5:
+            continue
+
+        field_name = parts[2].strip()
+        input_type = parts[3].strip()
+        # Rejoin remaining columns so pipe chars inside content are preserved
+        content = '|'.join(parts[4:-1]).strip()
+
+        slug = field_name_to_slug(field_name)
+        if not slug:
+            continue
+
+        if input_type == "Embedded (Custom Code)":
+            if content.startswith('`') and content.endswith('`'):
+                content = content[1:-1]
+        elif input_type == "Rich Text":
+            content = rich_text_bullets_to_html(content)
+
+        fields[slug] = (content, input_type)
+
+    return fields
+
+
 # ─── STREAMLIT UI ─────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Edstellar Blog → Webflow", page_icon="🚀", layout="wide")
@@ -945,7 +1003,7 @@ with st.sidebar:
 
 # Slug input
 # Mode selector
-mode = st.radio("📋 Mode", ["Update Existing Blog", "Create New Blog"], horizontal=True)
+mode = st.radio("📋 Mode", ["Update Existing Blog", "Create New Blog", "Push CMS Fields (.md)"], horizontal=True)
 
 # Initialize variables for both modes
 slug = ""
@@ -989,7 +1047,7 @@ if mode == "Update Existing Blog":
             edit_meta_desc = st.text_area("Meta Description", value=fd.get("meta-description", ""), key="edit_meta_desc", max_chars=300)
             edit_canonical = st.text_input("Canonical Links", value=fd.get("canonical-links", ""), key="edit_canonical")
 
-else:
+elif mode == "Create New Blog":
     # Create new mode
     new_name = st.text_input("📝 Blog Post Title (Name)*",
                               placeholder="11 Best Corporate Training Companies in Malaysia for 2026")
@@ -1013,6 +1071,124 @@ else:
         new_faqs_section = st.checkbox("FAQS Section", value=True)
 
     slug = new_slug  # for file naming
+
+# ── Push CMS Fields (.md) mode ────────────────────────────────────────────────
+if mode == "Push CMS Fields (.md)":
+    st.divider()
+    st.subheader("📋 Push CMS Fields from Markdown")
+
+    if not api_token or not collection_id:
+        st.warning("Enter your Webflow API token and Collection ID in the sidebar.")
+        st.stop()
+
+    md_file = st.file_uploader(
+        "Upload CMS Fields .md file", type=["md"],
+        help="Markdown table with columns: Section | Field Name | Input Type | Ref - Course Content",
+    )
+
+    if md_file:
+        md_content = md_file.read().decode("utf-8")
+        parsed = parse_cms_fields_md(md_content)
+
+        if not parsed:
+            st.error("No fields found. Check that the file contains the expected table format.")
+            st.stop()
+
+        st.success(f"Parsed **{len(parsed)} fields** from `{md_file.name}`")
+
+        # Field preview
+        with st.expander("📋 Field Preview", expanded=True):
+            for slug_key, (value, input_type) in parsed.items():
+                col_a, col_b = st.columns([1, 3])
+                with col_a:
+                    st.markdown(f"`{slug_key}`")
+                    st.caption(input_type)
+                with col_b:
+                    preview = value[:160].replace("\n", " ")
+                    st.caption(preview + ("…" if len(value) > 160 else ""))
+
+        st.divider()
+        md_action = st.radio("Action", ["Create New Item", "Update Existing Item"],
+                              horizontal=True, key="md_action")
+
+        field_data = {k: v for k, (v, _) in parsed.items()}
+
+        if md_action == "Update Existing Item":
+            md_slug = st.text_input(
+                "Slug of item to update",
+                placeholder="burnout-prevention-and-recovery-training",
+                key="md_update_slug",
+            )
+
+            if md_slug and api_token and collection_id:
+                if st.button("🔍 Find Item", key="md_find"):
+                    with st.spinner("Searching..."):
+                        item, error = search_item_by_slug(api_token, md_slug, collection_id)
+                    if error:
+                        st.error(error)
+                        st.session_state.pop("md_found_item", None)
+                    else:
+                        st.session_state["md_found_item"] = item
+                        st.success(f"✅ **{item['fieldData'].get('name')}** — ID: `{item['id']}`")
+
+            found_md = st.session_state.get("md_found_item")
+            if found_md:
+                item_id = found_md["id"]
+                item_name = found_md["fieldData"].get("name", item_id)
+                target = "**LIVE**" if push_live else "**Draft (staged)**"
+                st.info(f"Update **{item_name}** → {target} | {len(field_data)} fields")
+
+                confirm = st.checkbox(f"I confirm: update '{item_name}'", key="md_confirm_update")
+                if confirm:
+                    if st.button("🚀 Push All Fields", type="primary",
+                                  use_container_width=True, key="md_push_update"):
+                        with st.spinner("Pushing to Webflow..."):
+                            if push_live:
+                                url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items/live"
+                            else:
+                                url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items"
+                            payload = {"items": [{"id": item_id, "fieldData": field_data}]}
+                            resp = requests.patch(url, headers=get_headers(api_token), json=payload)
+
+                        if resp.status_code == 200:
+                            st.success("✅ Updated successfully!")
+                            st.balloons()
+                            with st.expander("API Response"):
+                                st.json(resp.json())
+                        else:
+                            st.error(f"❌ Failed — HTTP {resp.status_code}")
+                            st.code(resp.text, language="json")
+
+        else:  # Create New Item
+            name_val = field_data.get("name", "")
+            slug_val = field_data.get("slug", "")
+            if name_val:
+                st.info(f"**Create:** {name_val}\n\nSlug: `{slug_val}` | {len(field_data)} fields | Status: Draft")
+            else:
+                st.warning("No 'name' field found in the markdown — required by Webflow.")
+
+            confirm = st.checkbox(
+                f"I confirm: create new item '{name_val or '(unnamed)'}'",
+                key="md_confirm_create",
+            )
+            if confirm:
+                if st.button("🚀 Create Item", type="primary",
+                              use_container_width=True, key="md_push_create"):
+                    with st.spinner("Creating in Webflow..."):
+                        url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items"
+                        payload = {"items": [{"fieldData": field_data, "isDraft": True}]}
+                        resp = requests.post(url, headers=get_headers(api_token), json=payload)
+
+                    if resp.status_code in (200, 201, 202):
+                        st.success("✅ Item created as Draft!")
+                        st.balloons()
+                        with st.expander("API Response"):
+                            st.json(resp.json())
+                    else:
+                        st.error(f"❌ Failed — HTTP {resp.status_code}")
+                        st.code(resp.text, language="json")
+
+    st.stop()
 
 st.divider()
 
