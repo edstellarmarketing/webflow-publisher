@@ -1231,13 +1231,16 @@ if mode == "Push CMS Fields (.md)":
 
         st.success(f"Parsed **{len(parsed)} fields** from `{md_file.name}`")
 
-        # ── Load the real collection schema ──────────────────────────────────
-        with st.spinner("Loading collection schema…"):
-            schema, schema_err = fetch_collection_schema(api_token, collection_id)
-
-        if schema_err:
-            st.error(f"Failed to load schema: {schema_err}")
-            st.stop()
+        # ── Load the real collection schema (cached per collection) ─────────
+        schema_key = f"schema_{collection_id}"
+        if schema_key not in st.session_state:
+            with st.spinner("Loading collection schema…"):
+                schema, schema_err = fetch_collection_schema(api_token, collection_id)
+            if schema_err:
+                st.error(f"Failed to load schema: {schema_err}")
+                st.stop()
+            st.session_state[schema_key] = schema
+        schema = st.session_state[schema_key]
 
         field_map = schema["field_map"]  # {slug: field_info}
 
@@ -1270,16 +1273,26 @@ if mode == "Push CMS Fields (.md)":
                 mime="application/json",
             )
 
-        # Diagnostic: referenced collections + available values
+        # Diagnostic: referenced collections + available values (cached)
         ref_collection_ids = {
             (finfo.get("validations") or {}).get("collectionId")
             for finfo in field_map.values()
             if (finfo.get("validations") or {}).get("collectionId")
         }
         if ref_collection_ids:
+            ref_diag_key = f"ref_diag_{collection_id}"
             with st.expander(f"🔗 Referenced Collections ({len(ref_collection_ids)}) — values you can use"):
-                for rc in ref_collection_ids:
-                    items, err = list_reference_options(api_token, rc)
+                if ref_diag_key not in st.session_state:
+                    ref_diag = {}
+                    for rc in ref_collection_ids:
+                        with st.spinner(f"Loading `{rc}`…"):
+                            items, err = list_reference_options(api_token, rc)
+                        ref_diag[rc] = (items, err)
+                    st.session_state[ref_diag_key] = ref_diag
+                else:
+                    ref_diag = st.session_state[ref_diag_key]
+
+                for rc, (items, err) in ref_diag.items():
                     if err:
                         st.error(f"`{rc}` — could not load: {err}")
                         continue
@@ -1291,7 +1304,8 @@ if mode == "Push CMS Fields (.md)":
                     st.caption(" · ".join(sample) + ("…" if len(items) > 25 else ""))
 
         # ── Match each parsed entry to a real schema slug ────────────────────
-        ref_cache = {}
+        # Re-use cached ref lookups so API calls aren't repeated on every rerender
+        ref_cache = st.session_state.get(f"ref_cache_{collection_id}", {})
         field_data = {}
         matches = []          # list of (entry, resolved_slug or None)
         warnings_list = []
@@ -1328,6 +1342,9 @@ if mode == "Push CMS Fields (.md)":
             if resolved is None:
                 continue
             field_data[real_slug] = resolved
+
+        # Persist ref lookups so subsequent rerenders skip the API calls
+        st.session_state[f"ref_cache_{collection_id}"] = ref_cache
 
         # Preview panel
         skipped_count = sum(1 for _, s in matches if not s)
@@ -1407,34 +1424,56 @@ if mode == "Push CMS Fields (.md)":
                             st.error(f"❌ Failed — HTTP {resp.status_code}")
                             st.code(resp.text, language="json")
 
-        else:  # Create New Item
+        else:  # Create New Item (upsert: update if slug exists, create otherwise)
             name_val = field_data.get("name", "")
             slug_val = field_data.get("slug", "")
             if name_val:
-                st.info(f"**Create:** {name_val}\n\nSlug: `{slug_val}` | {len(field_data)} fields | Status: Draft")
+                st.info(f"**Create / Update:** {name_val}\n\nSlug: `{slug_val}` | {len(field_data)} fields | Status: Draft")
             else:
                 st.warning("No 'name' field found in the markdown — required by Webflow.")
 
             confirm = st.checkbox(
-                f"I confirm: create new item '{name_val or '(unnamed)'}'",
+                f"I confirm: push '{name_val or '(unnamed)'}'",
                 key="md_confirm_create",
             )
             if confirm:
-                if st.button("🚀 Create Item", type="primary",
+                if st.button("🚀 Push Item", type="primary",
                               use_container_width=True, key="md_push_create"):
-                    with st.spinner("Creating in Webflow..."):
-                        url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items"
-                        payload = {"items": [{"fieldData": field_data, "isDraft": True}]}
-                        resp = requests.post(url, headers=get_headers(api_token), json=payload)
+                    # ── Step 1: check if slug already exists ──────────────────
+                    with st.spinner("Checking if item already exists…"):
+                        existing, _ = search_item_by_slug(api_token, slug_val, collection_id)
 
-                    if resp.status_code in (200, 201, 202):
-                        st.success("✅ Item created as Draft!")
-                        st.balloons()
-                        with st.expander("API Response"):
-                            st.json(resp.json())
+                    if existing:
+                        # ── Update path ───────────────────────────────────────
+                        item_id = existing["id"]
+                        existing_name = existing["fieldData"].get("name", item_id)
+                        st.info(f"Slug exists — updating **{existing_name}** (`{item_id}`)…")
+                        with st.spinner("Updating…"):
+                            patch_url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items"
+                            patch_payload = {"items": [{"id": item_id, "fieldData": field_data}]}
+                            resp = requests.patch(patch_url, headers=get_headers(api_token), json=patch_payload)
+                        if resp.status_code == 200:
+                            st.success(f"✅ Updated '{existing_name}' successfully!")
+                            st.balloons()
+                            with st.expander("API Response"):
+                                st.json(resp.json())
+                        else:
+                            st.error(f"❌ Update failed — HTTP {resp.status_code}")
+                            st.code(resp.text, language="json")
                     else:
-                        st.error(f"❌ Failed — HTTP {resp.status_code}")
-                        st.code(resp.text, language="json")
+                        # ── Create path ───────────────────────────────────────
+                        with st.spinner("Creating new item…"):
+                            url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items"
+                            payload = {"items": [{"fieldData": field_data, "isDraft": True}]}
+                            resp = requests.post(url, headers=get_headers(api_token), json=payload)
+                        if resp.status_code in (200, 201, 202):
+                            st.success("✅ Item created as Draft!")
+                            st.balloons()
+                            with st.expander("API Response"):
+                                st.json(resp.json())
+                        else:
+                            st.error(f"❌ Failed — HTTP {resp.status_code}")
+                            st.code(resp.text, language="json")
 
     st.stop()
 
