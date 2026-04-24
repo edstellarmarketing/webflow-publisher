@@ -1016,8 +1016,13 @@ def rich_text_bullets_to_html(text):
 
 
 def parse_cms_fields_md(md_content):
-    """Parse a CMS fields markdown table into {webflow_slug: (value, input_type)}."""
-    fields = {}
+    """Parse a CMS fields markdown table.
+
+    Returns a list of dicts preserving the original display name, since the
+    display name is what Webflow's schema exposes and what we need to match
+    against. Each dict: {display_name, slug_guess, input_type, value}.
+    """
+    entries = []
     separator_seen = False
 
     for line in md_content.split('\n'):
@@ -1040,8 +1045,7 @@ def parse_cms_fields_md(md_content):
         # Rejoin remaining columns so pipe chars inside content are preserved
         content = '|'.join(parts[4:-1]).strip()
 
-        slug = field_name_to_slug(field_name)
-        if not slug:
+        if not field_name:
             continue
 
         if input_type == "Embedded (Custom Code)":
@@ -1050,9 +1054,14 @@ def parse_cms_fields_md(md_content):
         elif input_type == "Rich Text":
             content = rich_text_bullets_to_html(content)
 
-        fields[slug] = (content, input_type)
+        entries.append({
+            "display_name": field_name,
+            "slug_guess": field_name_to_slug(field_name),
+            "input_type": input_type,
+            "value": content,
+        })
 
-    return fields
+    return entries
 
 
 # ─── STREAMLIT UI ─────────────────────────────────────────────────────────────
@@ -1222,7 +1231,7 @@ if mode == "Push CMS Fields (.md)":
 
         st.success(f"Parsed **{len(parsed)} fields** from `{md_file.name}`")
 
-        # ── Align parsed slugs to the real collection schema ─────────────────
+        # ── Load the real collection schema ──────────────────────────────────
         with st.spinner("Loading collection schema…"):
             schema, schema_err = fetch_collection_schema(api_token, collection_id)
 
@@ -1230,19 +1239,30 @@ if mode == "Push CMS Fields (.md)":
             st.error(f"Failed to load schema: {schema_err}")
             st.stop()
 
-        field_map = schema["field_map"]
-        schema_slugs = set(field_map.keys())
+        field_map = schema["field_map"]  # {slug: field_info}
 
-        # Diagnostic: show schema field types so reference fields can be identified
+        # Build display-name → slug lookup (case / punctuation insensitive)
+        def _norm_name(s):
+            s = str(s).strip().lower()
+            return re.sub(r'[^a-z0-9]+', '', s)  # drop all non-alphanumeric
+
+        display_to_slug = {}
+        for fslug, finfo in field_map.items():
+            dn = finfo.get("displayName") or finfo.get("name") or ""
+            if dn:
+                display_to_slug[_norm_name(dn)] = fslug
+            # Also index by the slug itself as a fallback
+            display_to_slug.setdefault(_norm_name(fslug), fslug)
+
+        # Diagnostic: show schema field types
         with st.expander("🔎 Schema Inspector (field types)"):
-            rows = []
             for fslug, finfo in field_map.items():
                 ftype = finfo.get("type", "?")
+                dn = finfo.get("displayName", "")
                 validations = finfo.get("validations", {}) or {}
                 ref_col = validations.get("collectionId")
                 extra = f" → ref collection `{ref_col}`" if ref_col else ""
-                st.caption(f"`{fslug}` — **{ftype}**{extra}")
-                rows.append({"slug": fslug, "type": ftype, "refCollectionId": ref_col or ""})
+                st.caption(f"**{dn}** — slug: `{fslug}` — type: `{ftype}`{extra}")
             st.download_button(
                 "📥 Download schema as JSON",
                 data=json.dumps(schema["fields"], indent=2),
@@ -1250,7 +1270,7 @@ if mode == "Push CMS Fields (.md)":
                 mime="application/json",
             )
 
-        # Diagnostic: show the referenced-collection items we could load for lookup
+        # Diagnostic: referenced collections + available values
         ref_collection_ids = {
             (finfo.get("validations") or {}).get("collectionId")
             for finfo in field_map.values()
@@ -1270,70 +1290,68 @@ if mode == "Push CMS Fields (.md)":
                         sample.append(f"`{fd.get('slug', '?')}` — {fd.get('name', '?')}")
                     st.caption(" · ".join(sample) + ("…" if len(items) > 25 else ""))
 
-        def best_match_slug(parsed_slug):
-            if parsed_slug in schema_slugs:
-                return parsed_slug
-            # Try common pluralisation variants
-            for candidate in (parsed_slug + "s", parsed_slug.rstrip("s")):
-                if candidate in schema_slugs:
-                    return candidate
-            # Token overlap fallback
-            p_tokens = set(parsed_slug.split("-"))
-            best, best_score = None, 0
-            for real in schema_slugs:
-                r_tokens = set(real.split("-"))
-                score = len(p_tokens & r_tokens)
-                if score > best_score and score >= max(1, len(p_tokens) - 1):
-                    best, best_score = real, score
-            return best
-
+        # ── Match each parsed entry to a real schema slug ────────────────────
         ref_cache = {}
         field_data = {}
-        aliases = {}          # parsed_slug -> resolved schema_slug
-        skipped = []          # parsed_slug with no schema match
-        warnings_list = []    # resolution warnings
+        matches = []          # list of (entry, resolved_slug or None)
+        warnings_list = []
 
-        for parsed_slug, (value, input_type) in parsed.items():
-            real_slug = best_match_slug(parsed_slug)
+        for entry in parsed:
+            display = entry["display_name"]
+            norm = _norm_name(display)
+            real_slug = display_to_slug.get(norm)
+
+            # Fallback 1: derived slug exact match
+            if not real_slug and entry["slug_guess"] in field_map:
+                real_slug = entry["slug_guess"]
+
+            # Fallback 2: substring match against display names (longest-wins)
             if not real_slug:
-                skipped.append(parsed_slug)
-                continue
-            if real_slug != parsed_slug:
-                aliases[parsed_slug] = real_slug
+                best = None
+                for known_norm, known_slug in display_to_slug.items():
+                    if known_norm and (known_norm in norm or norm in known_norm):
+                        if best is None or len(known_norm) > len(best[0]):
+                            best = (known_norm, known_slug)
+                if best:
+                    real_slug = best[1]
 
-            resolved, warn = resolve_field_value(api_token, field_map[real_slug], value, ref_cache)
+            matches.append((entry, real_slug))
+
+            if not real_slug:
+                continue
+
+            resolved, warn = resolve_field_value(
+                api_token, field_map[real_slug], entry["value"], ref_cache
+            )
             if warn:
-                warnings_list.append(f"`{real_slug}`: {warn}")
+                warnings_list.append(f"**{display}** (`{real_slug}`): {warn}")
             if resolved is None:
-                # Skip unresolved reference/option values instead of pushing a bad value
-                skipped.append(real_slug)
                 continue
             field_data[real_slug] = resolved
 
-        # Field preview with schema alignment
-        with st.expander("📋 Field Preview (schema-aligned)", expanded=True):
-            for parsed_slug, (value, input_type) in parsed.items():
+        # Preview panel
+        skipped_count = sum(1 for _, s in matches if not s)
+        with st.expander(f"📋 Field Mapping ({len(matches) - skipped_count} matched / {skipped_count} unmatched)", expanded=True):
+            for entry, real_slug in matches:
                 col_a, col_b = st.columns([1, 3])
                 with col_a:
-                    if parsed_slug in skipped:
-                        st.markdown(f"~~`{parsed_slug}`~~")
-                        st.caption(f"{input_type} · ⚠️ no schema match")
-                    elif parsed_slug in aliases:
-                        st.markdown(f"`{parsed_slug}` → `{aliases[parsed_slug]}`")
-                        st.caption(input_type)
+                    if real_slug:
+                        schema_dn = field_map[real_slug].get("displayName", real_slug)
+                        st.markdown(f"**{entry['display_name']}**")
+                        st.caption(f"→ `{real_slug}` · {entry['input_type']}")
+                        if _norm_name(schema_dn) != _norm_name(entry['display_name']):
+                            st.caption(f"matched via: *{schema_dn}*")
                     else:
-                        st.markdown(f"`{parsed_slug}`")
-                        st.caption(input_type)
+                        st.markdown(f"~~**{entry['display_name']}**~~")
+                        st.caption(f"⚠️ no schema match · {entry['input_type']}")
                 with col_b:
-                    preview = value[:160].replace("\n", " ")
-                    st.caption(preview + ("…" if len(value) > 160 else ""))
+                    preview = entry["value"][:160].replace("\n", " ")
+                    st.caption(preview + ("…" if len(entry["value"]) > 160 else ""))
 
-        if skipped:
-            st.warning(f"**Skipped {len(skipped)} fields not in collection schema:** "
-                       + ", ".join(f"`{s}`" for s in skipped))
-        if aliases:
-            st.info("**Auto-mapped slugs:** "
-                    + ", ".join(f"`{k}`→`{v}`" for k, v in aliases.items()))
+        unmatched = [e["display_name"] for e, s in matches if not s]
+        if unmatched:
+            st.warning(f"**Skipped {len(unmatched)} fields** (no schema match): "
+                       + ", ".join(f"_{u}_" for u in unmatched))
         if warnings_list:
             with st.expander(f"⚠️ {len(warnings_list)} resolution warnings"):
                 for w in warnings_list:
