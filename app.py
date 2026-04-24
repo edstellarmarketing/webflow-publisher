@@ -878,6 +878,10 @@ def list_reference_options(token, ref_collection_id):
     return items, None
 
 
+REF_TYPE_NAMES = {"Reference", "ItemRef", "ItemReference", "CollectionItem"}
+MULTI_REF_TYPE_NAMES = {"MultiReference", "ItemRefSet", "MultiItemRef", "MultiCollectionItem"}
+
+
 def resolve_field_value(token, field_info, raw_value, ref_cache):
     """
     Convert a raw markdown value into the API-expected shape for the field type.
@@ -888,9 +892,11 @@ def resolve_field_value(token, field_info, raw_value, ref_cache):
     if raw_value is None or raw_value == "":
         return raw_value, None
 
+    validations = field_info.get("validations", {}) or {}
+    has_ref_collection = bool(validations.get("collectionId"))
+
     # Simple Option field: {options: [{id, name, ...}]}
     if ftype == "Option":
-        validations = field_info.get("validations", {}) or {}
         options = validations.get("options", []) or []
         lower_val = str(raw_value).strip().lower()
         for opt in options:
@@ -901,12 +907,16 @@ def resolve_field_value(token, field_info, raw_value, ref_cache):
                 return opt.get("id"), None
         return raw_value, f"Option value '{raw_value}' not found in field options"
 
-    # Reference to another collection: validations.collectionId
-    if ftype in ("Reference", "MultiReference"):
-        validations = field_info.get("validations", {}) or {}
+    # Reference to another collection.
+    # Trust any field type that carries a collectionId validation, since
+    # Webflow's API has used several names for this (Reference, ItemRef, etc).
+    is_multi = ftype in MULTI_REF_TYPE_NAMES
+    is_single = ftype in REF_TYPE_NAMES or (has_ref_collection and not is_multi)
+
+    if is_multi or is_single:
         ref_col = validations.get("collectionId")
         if not ref_col:
-            return raw_value, "Reference field has no collectionId in schema"
+            return raw_value, f"Reference-like field (type={ftype}) has no collectionId in schema"
 
         # Memoise items per referenced collection
         if ref_col not in ref_cache:
@@ -929,7 +939,7 @@ def resolve_field_value(token, field_info, raw_value, ref_cache):
                     return i
             return None
 
-        if ftype == "MultiReference":
+        if is_multi:
             vals = [v.strip() for v in str(raw_value).split(";") if v.strip()]
             ids, missing = [], []
             for v in vals:
@@ -1211,6 +1221,15 @@ if mode == "Push CMS Fields (.md)":
 
         field_map = schema["field_map"]
         schema_slugs = set(field_map.keys())
+
+        # Diagnostic: show schema field types so reference fields can be identified
+        with st.expander("🔎 Schema Inspector (field types)"):
+            for fslug, finfo in field_map.items():
+                ftype = finfo.get("type", "?")
+                validations = finfo.get("validations", {}) or {}
+                ref_col = validations.get("collectionId")
+                extra = f" → ref collection `{ref_col}`" if ref_col else ""
+                st.caption(f"`{fslug}` — **{ftype}**{extra}")
 
         def best_match_slug(parsed_slug):
             if parsed_slug in schema_slugs:
