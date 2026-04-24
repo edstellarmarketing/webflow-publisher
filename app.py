@@ -931,10 +931,10 @@ def parse_cms_fields_md(md_content):
 
 # ─── STREAMLIT UI ─────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="Edstellar Blog → Webflow", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="Edstellar → Webflow CMS Publisher", page_icon="🚀", layout="wide")
 
-st.title("🚀 Edstellar Blog Content → Webflow CMS")
-st.caption("Upload HTML → Preview processed blocks → Push to Webflow content field")
+st.title("🚀 Edstellar → Webflow CMS Publisher")
+st.caption("Upload HTML or CMS fields → Preview → Push to any Webflow collection")
 
 # Sidebar
 with st.sidebar:
@@ -972,7 +972,7 @@ with st.sidebar:
             items = results.get("items", {})
             if items:
                 if "total_items" in items:
-                    st.success(f"**Items:** {items['status']} — {items['total_items']} blog posts")
+                    st.success(f"**Items:** {items['status']} — {items['total_items']} items")
                     st.caption(f"Sample: {items.get('sample', '—')}")
                 else:
                     st.error(f"**Items:** {items['status']}")
@@ -991,7 +991,7 @@ with st.sidebar:
     st.divider()
     st.markdown("""
     **Workflow:**
-    1. Enter blog slug
+    1. Enter item slug
     2. Upload HTML file
     3. Auto-processes into blocks
     4. Preview & push
@@ -1003,7 +1003,7 @@ with st.sidebar:
 
 # Slug input
 # Mode selector
-mode = st.radio("📋 Mode", ["Update Existing Blog", "Create New Blog", "Push CMS Fields (.md)"], horizontal=True)
+mode = st.radio("📋 Mode", ["Update Existing Item", "Create New Item", "Push CMS Fields (.md)"], horizontal=True)
 
 # Initialize variables for both modes
 slug = ""
@@ -1018,13 +1018,13 @@ new_keyword_volume = 0
 new_format_blog = True
 new_faqs_section = True
 
-if mode == "Update Existing Blog":
-    slug = st.text_input("🔗 Blog Post Slug",
+if mode == "Update Existing Item":
+    slug = st.text_input("🔗 Item Slug",
                           placeholder="corporate-training-companies-malaysia",
-                          help="Slug of the existing blog post to update")
+                          help="Slug of the existing item to update")
 
     if slug and api_token:
-        if st.button("🔍 Find Blog Post"):
+        if st.button("🔍 Find Item"):
             with st.spinner("Searching..."):
                 item, error = search_item_by_slug(api_token, slug, collection_id)
             if error:
@@ -1040,16 +1040,16 @@ if mode == "Update Existing Blog":
     found_item = st.session_state.get("found_item")
     if found_item:
         fd = found_item.get("fieldData", {})
-        with st.expander("✏️ Edit Meta Fields (pre-filled from existing blog)", expanded=True):
+        with st.expander("✏️ Edit Fields (pre-filled from existing item)", expanded=True):
             edit_name = st.text_input("Name (H1)", value=fd.get("name", ""), key="edit_name")
             edit_slug = st.text_input("Slug", value=fd.get("slug", ""), key="edit_slug")
             edit_meta_title = st.text_input("Meta Title", value=fd.get("meta-title", ""), key="edit_meta_title")
             edit_meta_desc = st.text_area("Meta Description", value=fd.get("meta-description", ""), key="edit_meta_desc", max_chars=300)
             edit_canonical = st.text_input("Canonical Links", value=fd.get("canonical-links", ""), key="edit_canonical")
 
-elif mode == "Create New Blog":
+elif mode == "Create New Item":
     # Create new mode
-    new_name = st.text_input("📝 Blog Post Title (Name)*",
+    new_name = st.text_input("📝 Item Name*",
                               placeholder="11 Best Corporate Training Companies in Malaysia for 2026")
     new_slug = st.text_input("🔗 Slug*",
                               placeholder="corporate-training-companies-malaysia",
@@ -1064,7 +1064,7 @@ elif mode == "Create New Blog":
         new_meta_title = st.text_input("Meta Title", placeholder="Same as title if blank")
         new_meta_desc = st.text_area("Meta Description", placeholder="Short description for SEO", max_chars=300)
         new_description = st.text_area("Description (excerpt)", placeholder="Short excerpt for listings", max_chars=500)
-        new_canonical = st.text_input("Canonical URL", placeholder="https://www.edstellar.com/blog/your-slug")
+        new_canonical = st.text_input("Canonical URL", placeholder="https://www.edstellar.com/your-slug")
         new_primary_keyword = st.text_input("Primary Keyword", placeholder="corporate training companies malaysia")
         new_keyword_volume = st.number_input("Keyword Search Volume", min_value=0, value=0)
         new_format_blog = st.checkbox("New Format Blog", value=True)
@@ -1228,7 +1228,7 @@ if upload_type == "Webflow-Ready HTML (direct push)":
         st.success(f"✅ {len(blocks_list)} blocks loaded directly (no conversion)")
 
 elif upload_type == "Raw HTML (auto-converts)":
-    uploaded_file = st.file_uploader("📄 Upload Blog HTML", type=["html", "htm"])
+    uploaded_file = st.file_uploader("📄 Upload HTML", type=["html", "htm"])
 
     if uploaded_file:
         raw_html = uploaded_file.read().decode("utf-8")
@@ -1464,10 +1464,10 @@ if "blocks" in st.session_state:
 
     if not api_token or not collection_id:
         st.warning("Enter your Webflow API token and Collection ID in the sidebar.")
-    elif mode == "Update Existing Blog":
+    elif mode == "Update Existing Item":
         found_item = st.session_state.get("found_item")
         if not found_item:
-            st.warning("Search for the blog post first using the slug above.")
+            st.warning("Search for the item first using the slug above.")
         else:
             item_name = found_item["fieldData"].get("name", "?")
             item_id = found_item["id"]
@@ -1519,9 +1519,9 @@ if "blocks" in st.session_state:
                         st.error(f"❌ Failed — HTTP {resp.status_code}")
                         st.code(resp.text, language="json")
 
-    else:  # Create New Blog
+    else:  # Create New Item
         if not new_name or not new_slug:
-            st.warning("Title and Slug are required to create a new blog post.")
+            st.warning("Name and Slug are required to create a new item.")
         else:
             # Build extra fields
             extra = {}
@@ -1534,7 +1534,7 @@ if "blocks" in st.session_state:
             if new_canonical:
                 extra["canonical-links"] = new_canonical
             elif new_slug:
-                extra["canonical-links"] = f"https://www.edstellar.com/blog/{new_slug}"
+                extra["canonical-links"] = f"https://www.edstellar.com/{new_slug}"
             if new_primary_keyword:
                 extra["primary-keyword"] = new_primary_keyword
             if new_keyword_volume:
@@ -1547,14 +1547,14 @@ if "blocks" in st.session_state:
             fields_summary = ", ".join(f"{k}" for k in extra.keys() if extra[k])
             st.caption(f"Extra fields: {fields_summary}")
 
-            confirm = st.checkbox(f"I confirm: create new blog post '{new_name}'")
+            confirm = st.checkbox(f"I confirm: create new item '{new_name}'")
             if confirm:
-                if st.button("🚀 Create Blog Post", type="primary", use_container_width=True):
+                if st.button("🚀 Create Item", type="primary", use_container_width=True):
                     with st.spinner("Creating in Webflow..."):
                         resp = create_new_item(api_token, new_name, new_slug, processed_html, collection_id, extra)
 
                     if resp.status_code in (200, 201, 202):
-                        st.success("✅ Blog post created as Draft!")
+                        st.success("✅ Item created as Draft!")
                         st.balloons()
                         with st.expander("API Response"):
                             st.json(resp.json())
