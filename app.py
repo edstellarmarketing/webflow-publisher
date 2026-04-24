@@ -845,6 +845,111 @@ def update_item_content(token, item_id, content_html, collection_id, live=False)
     return resp
 
 
+def fetch_collection_schema(token, collection_id):
+    """Return {'fields': [...], 'field_map': {slug: field_info}} for the collection."""
+    resp = requests.get(f"{WEBFLOW_API_BASE}/collections/{collection_id}",
+                        headers=get_headers(token))
+    if resp.status_code != 200:
+        return None, f"HTTP {resp.status_code}: {resp.text}"
+    data = resp.json()
+    fields = data.get("fields", [])
+    field_map = {f.get("slug"): f for f in fields if f.get("slug")}
+    return {"fields": fields, "field_map": field_map, "raw": data}, None
+
+
+def list_reference_options(token, ref_collection_id):
+    """List all items in a referenced collection, paginated."""
+    items = []
+    offset = 0
+    while True:
+        resp = requests.get(
+            f"{WEBFLOW_API_BASE}/collections/{ref_collection_id}/items",
+            headers=get_headers(token),
+            params={"offset": offset, "limit": 100},
+        )
+        if resp.status_code != 200:
+            return items, f"HTTP {resp.status_code}: {resp.text}"
+        data = resp.json()
+        items.extend(data.get("items", []))
+        total = data.get("pagination", {}).get("total", 0)
+        offset += 100
+        if offset >= total:
+            break
+    return items, None
+
+
+def resolve_field_value(token, field_info, raw_value, ref_cache):
+    """
+    Convert a raw markdown value into the API-expected shape for the field type.
+    Returns (converted_value, warning_or_none).
+    ref_cache: dict used to memoise reference-collection lookups across calls.
+    """
+    ftype = field_info.get("type", "")
+    if raw_value is None or raw_value == "":
+        return raw_value, None
+
+    # Simple Option field: {options: [{id, name, ...}]}
+    if ftype == "Option":
+        validations = field_info.get("validations", {}) or {}
+        options = validations.get("options", []) or []
+        lower_val = str(raw_value).strip().lower()
+        for opt in options:
+            if str(opt.get("name", "")).strip().lower() == lower_val or \
+               str(opt.get("id", "")) == str(raw_value):
+                return opt.get("id"), None
+            if str(opt.get("name", "")).strip().lower().replace(" ", "-") == lower_val:
+                return opt.get("id"), None
+        return raw_value, f"Option value '{raw_value}' not found in field options"
+
+    # Reference to another collection: validations.collectionId
+    if ftype in ("Reference", "MultiReference"):
+        validations = field_info.get("validations", {}) or {}
+        ref_col = validations.get("collectionId")
+        if not ref_col:
+            return raw_value, "Reference field has no collectionId in schema"
+
+        # Memoise items per referenced collection
+        if ref_col not in ref_cache:
+            items, err = list_reference_options(token, ref_col)
+            if err:
+                return raw_value, f"Could not load ref collection: {err}"
+            ref_cache[ref_col] = items
+
+        items = ref_cache[ref_col]
+
+        def find_item(lookup):
+            lookup = str(lookup).strip().lower()
+            for i in items:
+                fd = i.get("fieldData", {})
+                name = str(fd.get("name", "")).strip().lower()
+                slug_v = str(fd.get("slug", "")).strip().lower()
+                if (slug_v == lookup or name == lookup
+                        or name.replace(" ", "-") == lookup
+                        or str(i.get("id", "")) == lookup):
+                    return i
+            return None
+
+        if ftype == "MultiReference":
+            vals = [v.strip() for v in str(raw_value).split(";") if v.strip()]
+            ids, missing = [], []
+            for v in vals:
+                hit = find_item(v)
+                if hit:
+                    ids.append(hit["id"])
+                else:
+                    missing.append(v)
+            if missing:
+                return ids, f"Missing MultiReference values: {', '.join(missing)}"
+            return ids, None
+
+        hit = find_item(raw_value)
+        if hit:
+            return hit["id"], None
+        return raw_value, f"Reference value '{raw_value}' not found in collection {ref_col}"
+
+    return raw_value, None
+
+
 def create_new_item(token, name, slug, content_html, collection_id, extra_fields=None):
     """Create a new item in the collection."""
     url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items"
@@ -1096,22 +1201,85 @@ if mode == "Push CMS Fields (.md)":
 
         st.success(f"Parsed **{len(parsed)} fields** from `{md_file.name}`")
 
-        # Field preview
-        with st.expander("📋 Field Preview", expanded=True):
-            for slug_key, (value, input_type) in parsed.items():
+        # ── Align parsed slugs to the real collection schema ─────────────────
+        with st.spinner("Loading collection schema…"):
+            schema, schema_err = fetch_collection_schema(api_token, collection_id)
+
+        if schema_err:
+            st.error(f"Failed to load schema: {schema_err}")
+            st.stop()
+
+        field_map = schema["field_map"]
+        schema_slugs = set(field_map.keys())
+
+        def best_match_slug(parsed_slug):
+            if parsed_slug in schema_slugs:
+                return parsed_slug
+            # Try common pluralisation variants
+            for candidate in (parsed_slug + "s", parsed_slug.rstrip("s")):
+                if candidate in schema_slugs:
+                    return candidate
+            # Token overlap fallback
+            p_tokens = set(parsed_slug.split("-"))
+            best, best_score = None, 0
+            for real in schema_slugs:
+                r_tokens = set(real.split("-"))
+                score = len(p_tokens & r_tokens)
+                if score > best_score and score >= max(1, len(p_tokens) - 1):
+                    best, best_score = real, score
+            return best
+
+        ref_cache = {}
+        field_data = {}
+        aliases = {}          # parsed_slug -> resolved schema_slug
+        skipped = []          # parsed_slug with no schema match
+        warnings_list = []    # resolution warnings
+
+        for parsed_slug, (value, input_type) in parsed.items():
+            real_slug = best_match_slug(parsed_slug)
+            if not real_slug:
+                skipped.append(parsed_slug)
+                continue
+            if real_slug != parsed_slug:
+                aliases[parsed_slug] = real_slug
+
+            resolved, warn = resolve_field_value(api_token, field_map[real_slug], value, ref_cache)
+            if warn:
+                warnings_list.append(f"`{real_slug}`: {warn}")
+            field_data[real_slug] = resolved
+
+        # Field preview with schema alignment
+        with st.expander("📋 Field Preview (schema-aligned)", expanded=True):
+            for parsed_slug, (value, input_type) in parsed.items():
                 col_a, col_b = st.columns([1, 3])
                 with col_a:
-                    st.markdown(f"`{slug_key}`")
-                    st.caption(input_type)
+                    if parsed_slug in skipped:
+                        st.markdown(f"~~`{parsed_slug}`~~")
+                        st.caption(f"{input_type} · ⚠️ no schema match")
+                    elif parsed_slug in aliases:
+                        st.markdown(f"`{parsed_slug}` → `{aliases[parsed_slug]}`")
+                        st.caption(input_type)
+                    else:
+                        st.markdown(f"`{parsed_slug}`")
+                        st.caption(input_type)
                 with col_b:
                     preview = value[:160].replace("\n", " ")
                     st.caption(preview + ("…" if len(value) > 160 else ""))
 
+        if skipped:
+            st.warning(f"**Skipped {len(skipped)} fields not in collection schema:** "
+                       + ", ".join(f"`{s}`" for s in skipped))
+        if aliases:
+            st.info("**Auto-mapped slugs:** "
+                    + ", ".join(f"`{k}`→`{v}`" for k, v in aliases.items()))
+        if warnings_list:
+            with st.expander(f"⚠️ {len(warnings_list)} resolution warnings"):
+                for w in warnings_list:
+                    st.caption(w)
+
         st.divider()
         md_action = st.radio("Action", ["Create New Item", "Update Existing Item"],
                               horizontal=True, key="md_action")
-
-        field_data = {k: v for k, (v, _) in parsed.items()}
 
         if md_action == "Update Existing Item":
             md_slug = st.text_input(
