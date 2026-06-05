@@ -1374,6 +1374,22 @@ if mode == "Push CMS Fields (.md)":
         # Persist ref lookups so subsequent rerenders skip the API calls
         st.session_state[f"ref_cache_{collection_id}"] = ref_cache
 
+        # ── Create-mode preset ───────────────────────────────────────────────
+        # A NEW item needs Name + Slug + the core fields, so in "Create New Item"
+        # mode default ALL matched fields ON. In "Update Existing Item" mode the
+        # identity/core fields stay OFF (don't overwrite structural fields). The
+        # md_action radio renders below, so read its persisted value here; reset the
+        # per-field selections whenever the action changes so the right defaults apply.
+        md_action_current = st.session_state.get("md_action", "Update Existing Item")
+        is_create_mode = md_action_current == "Create New Item"
+        if st.session_state.get(f"_md_last_action_{collection_id}") != md_action_current:
+            for _k in [k for k in st.session_state if k.startswith(f"pushfld_{collection_id}_")]:
+                del st.session_state[_k]
+            st.session_state[f"_md_last_action_{collection_id}"] = md_action_current
+        if is_create_mode:
+            st.caption("🆕 **Create mode:** identity + core fields (Name, Slug, …) are included by "
+                       "default — a new item requires them. New items are pushed as **Draft**.")
+
         # ── Bulk select / deselect (set state before the checkboxes render) ──
         sel_c1, sel_c2 = st.columns(2)
         with sel_c1:
@@ -1399,7 +1415,9 @@ if mode == "Push CMS Fields (.md)":
                     if real_slug and real_slug in resolved_data:
                         chk_key = f"pushfld_{collection_id}_{real_slug}"
                         if chk_key not in st.session_state:
-                            st.session_state[chk_key] = not default_skip
+                            # Create mode: everything ON (new item needs identity+core).
+                            # Update mode: identity/core fields OFF by default.
+                            st.session_state[chk_key] = is_create_mode or (not default_skip)
                         if st.checkbox("push", key=chk_key, label_visibility="collapsed"):
                             push_slugs.add(real_slug)
                     else:
@@ -1440,7 +1458,9 @@ if mode == "Push CMS Fields (.md)":
                     st.caption(w)
 
         st.divider()
-        md_action = st.radio("Action", ["Create New Item", "Update Existing Item"],
+        # "Update Existing Item" is first = default (the common optimization case, keeps
+        # identity fields OFF). Pick "Create New Item" for brand-new courses (identity ON).
+        md_action = st.radio("Action", ["Update Existing Item", "Create New Item"],
                               horizontal=True, key="md_action")
 
         if md_action == "Update Existing Item":
