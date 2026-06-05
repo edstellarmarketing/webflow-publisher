@@ -1303,11 +1303,28 @@ if mode == "Push CMS Fields (.md)":
                         sample.append(f"`{fd.get('slug', '?')}` — {fd.get('name', '?')}")
                     st.caption(" · ".join(sample) + ("…" if len(items) > 25 else ""))
 
+        # Fields that DEFAULT to "skip" (unticked) in the push selector below.
+        # The user can always override per field. Matched against the normalized
+        # .md label, the schema display name, and the field slug, so any of
+        # those labels flips the default to skip.
+        DEFAULT_SKIP_FIELDS = {
+            "name",
+            "slug",
+            "canonical", "canonicallinks", "canonicalurl",
+            "coursename",
+            "deliverytype",
+            "duration",
+            "whichcourselevel",
+            "whichcoursetype",
+            "whichcoursecategory",
+            "whichcoursesubcategory",
+        }
+
         # ── Match each parsed entry to a real schema slug ────────────────────
         # Re-use cached ref lookups so API calls aren't repeated on every rerender
         ref_cache = st.session_state.get(f"ref_cache_{collection_id}", {})
-        field_data = {}
-        matches = []          # list of (entry, resolved_slug or None)
+        resolved_data = {}    # {slug: resolved_value} for every matched+resolved field
+        matches = []          # list of (entry, resolved_slug or None, default_skip)
         warnings_list = []
 
         for entry in parsed:
@@ -1329,7 +1346,18 @@ if mode == "Push CMS Fields (.md)":
                 if best:
                     real_slug = best[1]
 
-            matches.append((entry, real_slug))
+            # Decide the default push/skip for this field.
+            schema_norm = ""
+            if real_slug:
+                schema_dn = field_map[real_slug].get("displayName") or field_map[real_slug].get("name") or ""
+                schema_norm = _norm_name(schema_dn)
+            default_skip = (
+                norm in DEFAULT_SKIP_FIELDS
+                or schema_norm in DEFAULT_SKIP_FIELDS
+                or _norm_name(real_slug or "") in DEFAULT_SKIP_FIELDS
+            )
+
+            matches.append((entry, real_slug, default_skip))
 
             if not real_slug:
                 continue
@@ -1341,20 +1369,48 @@ if mode == "Push CMS Fields (.md)":
                 warnings_list.append(f"**{display}** (`{real_slug}`): {warn}")
             if resolved is None:
                 continue
-            field_data[real_slug] = resolved
+            resolved_data[real_slug] = resolved
 
         # Persist ref lookups so subsequent rerenders skip the API calls
         st.session_state[f"ref_cache_{collection_id}"] = ref_cache
 
-        # Preview panel
-        skipped_count = sum(1 for _, s in matches if not s)
-        with st.expander(f"📋 Field Mapping ({len(matches) - skipped_count} matched / {skipped_count} unmatched)", expanded=True):
-            for entry, real_slug in matches:
-                col_a, col_b = st.columns([1, 3])
+        # ── Bulk select / deselect (set state before the checkboxes render) ──
+        sel_c1, sel_c2 = st.columns(2)
+        with sel_c1:
+            if st.button("✅ Select all", key="md_select_all", use_container_width=True):
+                for _, rslug, _ in matches:
+                    if rslug in resolved_data:
+                        st.session_state[f"pushfld_{collection_id}_{rslug}"] = True
+        with sel_c2:
+            if st.button("⬜ Deselect all", key="md_deselect_all", use_container_width=True):
+                for _, rslug, _ in matches:
+                    if rslug in resolved_data:
+                        st.session_state[f"pushfld_{collection_id}_{rslug}"] = False
+
+        # ── Preview + per-field push/skip selector ───────────────────────────
+        skipped_count = sum(1 for _, s, _ in matches if not s)
+        push_slugs = set()
+        with st.expander(f"📋 Field Mapping — tick the fields to push "
+                         f"({len(matches) - skipped_count} matched / {skipped_count} unmatched)",
+                         expanded=True):
+            for entry, real_slug, default_skip in matches:
+                col_chk, col_a, col_b = st.columns([0.5, 1, 3])
+                with col_chk:
+                    if real_slug and real_slug in resolved_data:
+                        chk_key = f"pushfld_{collection_id}_{real_slug}"
+                        if chk_key not in st.session_state:
+                            st.session_state[chk_key] = not default_skip
+                        if st.checkbox("push", key=chk_key, label_visibility="collapsed"):
+                            push_slugs.add(real_slug)
+                    else:
+                        st.caption("—")
                 with col_a:
                     if real_slug:
                         schema_dn = field_map[real_slug].get("displayName", real_slug)
-                        st.markdown(f"**{entry['display_name']}**")
+                        label = f"**{entry['display_name']}**"
+                        if default_skip:
+                            label += " · _skip by default_"
+                        st.markdown(label)
                         st.caption(f"→ `{real_slug}` · {entry['input_type']}")
                         if _norm_name(schema_dn) != _norm_name(entry['display_name']):
                             st.caption(f"matched via: *{schema_dn}*")
@@ -1365,10 +1421,19 @@ if mode == "Push CMS Fields (.md)":
                     preview = entry["value"][:160].replace("\n", " ")
                     st.caption(preview + ("…" if len(entry["value"]) > 160 else ""))
 
-        unmatched = [e["display_name"] for e, s in matches if not s]
+        # Final payload — only the fields the user ticked
+        field_data = {k: v for k, v in resolved_data.items() if k in push_slugs}
+
+        unmatched = [e["display_name"] for e, s, _ in matches if not s]
         if unmatched:
             st.warning(f"**Skipped {len(unmatched)} fields** (no schema match): "
                        + ", ".join(f"_{u}_" for u in unmatched))
+        deselected = [field_map[s].get("displayName", s)
+                      for _, s, _ in matches if s in resolved_data and s not in push_slugs]
+        if deselected:
+            st.info(f"**{len(deselected)} fields unticked** (won't be pushed): "
+                    + ", ".join(f"_{u}_" for u in deselected))
+        st.caption(f"**{len(field_data)} field(s) will be pushed.**")
         if warnings_list:
             with st.expander(f"⚠️ {len(warnings_list)} resolution warnings"):
                 for w in warnings_list:
