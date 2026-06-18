@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Local credential cache (lives in $HOME, but ignore stray copies in repo)
+.webflow_publisher.json
+
+# Tooling / editor / OS
+.claude/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Working artifacts produced by the publisher
+webflow_collection_schema.json
+webflow_ready_*.html
+*.tmp
+
+# Repomix snapshots
+.agentmaster/
+
+# Env files — never commit
+.env
+.env.*
+!.env.example

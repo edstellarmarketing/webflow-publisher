@@ -9,6 +9,7 @@ import json
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 WEBFLOW_API_BASE = "https://api.webflow.com/v2"
 EMBED_CHAR_LIMIT = 10000
+REQUEST_TIMEOUT = 30  # seconds — keep Streamlit worker from hanging on a slow API
 
 # ─── EMBED DETECTION RULES ────────────────────────────────────────────────────
 # Top-level CSS classes that mark an element as an EMBED block.
@@ -205,8 +206,11 @@ def process_children(parent, blocks):
         if not isinstance(element, (Tag, NavigableString)):
             continue
 
-        # NavigableString that's not noise — skip loose text
+        # NavigableString that's not noise — wrap loose text in <p>
         if isinstance(element, NavigableString):
+            text = str(element).strip()
+            if text:
+                blocks.append(("plain", f"<p>{text}</p>"))
             continue
 
         # <style> → skip entirely (Webflow uses its own stylesheets)
@@ -543,9 +547,13 @@ def convert_cta_block(soup_tag, is_end_cta=False):
 
 
 def convert_quotes_to_single(html_str):
-    """Convert all double-quoted attributes to single quotes for Webflow."""
-    result = re.sub(r'(\w+)="([^"]*)"', r"\1='\2'", html_str)
-    return result
+    """Convert all double-quoted attributes to single quotes for Webflow.
+    Encodes any literal apostrophes inside the value first so the swap doesn't
+    produce malformed attrs like title='don't'."""
+    def _swap(m):
+        name, val = m.group(1), m.group(2)
+        return f"{name}='{val.replace(chr(39), '&#39;')}'"
+    return re.sub(r'(\w+)="([^"]*)"', _swap, html_str)
 
 
 def convert_block(block_type, block_html):
@@ -594,11 +602,6 @@ def classify_and_wrap(html_content):
     style_injected = False
     criteria_style_injected = False
     cta_count = 0  # Track CTAs to detect end CTA
-
-    # First pass: count CTAs to identify the last one
-    total_ctas = sum(1 for bt, bh in blocks
-                     if bt == "embed" and ("cta-block" in str(bh)[:200] or
-                                            "cta" in str(BeautifulSoup(bh, "html.parser").find().get("class", [])) if BeautifulSoup(bh, "html.parser").find() else False))
 
     for block_type, block_html in blocks:
         if block_type == "embed":
@@ -663,34 +666,37 @@ def classify_and_wrap(html_content):
                 output_parts.append(stripped)
                 plain_count += 1
 
-    # ── Post-processing: collect consecutive <details> into one FAQ section ──
-    final_parts = []
-    details_buffer = []
+    # ── Post-processing: collect ALL <details> into one FAQ section ──
+    # A stray non-details block between two <details> must NOT split the FAQ,
+    # so we gather every detail first, then emit one FAQ section in place of
+    # the first detail's slot and drop the rest.
+    all_details = []
     for part in output_parts:
-        # Check if this is a wrapped details block
         if 'data-rt-embed-type="true"' in part and "<details" in part:
-            # Extract the details tag
             s = BeautifulSoup(part, "html.parser")
             wrapper = s.find("div", attrs={"data-rt-embed-type": True})
             detail = wrapper.find("details") if wrapper else None
             if detail:
-                details_buffer.append(detail)
-                continue
-        else:
-            # Flush any buffered details as FAQ
-            if details_buffer:
-                faq_html = convert_faq_details(details_buffer)
-                faq_wrapped = f'<div data-rt-embed-type="true">\n{faq_html}\n</div>'
-                final_parts.append(faq_wrapped)
-                details_buffer = []
+                all_details.append(detail)
 
+    final_parts = []
+    faq_emitted = False
+    for part in output_parts:
+        is_detail_block = (
+            'data-rt-embed-type="true"' in part
+            and "<details" in part
+            and BeautifulSoup(part, "html.parser")
+                .find("div", attrs={"data-rt-embed-type": True})
+                .find("details") is not None
+        )
+        if is_detail_block:
+            if not faq_emitted and all_details:
+                faq_html = convert_faq_details(all_details)
+                final_parts.append(f'<div data-rt-embed-type="true">\n{faq_html}\n</div>')
+                faq_emitted = True
+            # Skip subsequent detail blocks — already folded into the FAQ
+            continue
         final_parts.append(part)
-
-    # Flush remaining details
-    if details_buffer:
-        faq_html = convert_faq_details(details_buffer)
-        faq_wrapped = f'<div data-rt-embed-type="true">\n{faq_html}\n</div>'
-        final_parts.append(faq_wrapped)
 
     processed_html = "\n".join(final_parts)
 
@@ -756,7 +762,7 @@ def test_api_connection(token, collection_id):
 
     # 1. Test token + collection access — get collection info
     resp = requests.get(f"{WEBFLOW_API_BASE}/collections/{collection_id}",
-                        headers=get_headers(token))
+                        headers=get_headers(token), timeout=REQUEST_TIMEOUT)
     if resp.status_code == 200:
         col = resp.json()
         results["collection"] = {
@@ -774,7 +780,8 @@ def test_api_connection(token, collection_id):
 
     # 2. Test items read — get first page count
     resp = requests.get(f"{WEBFLOW_API_BASE}/collections/{collection_id}/items",
-                        headers=get_headers(token), params={"limit": 1})
+                        headers=get_headers(token), params={"limit": 1},
+                        timeout=REQUEST_TIMEOUT)
     if resp.status_code == 200:
         data = resp.json()
         total = data.get("pagination", {}).get("total", 0)
@@ -787,7 +794,7 @@ def test_api_connection(token, collection_id):
 
     # 3. Test write scope — use token introspect
     resp = requests.get(f"{WEBFLOW_API_BASE}/token/introspect",
-                        headers=get_headers(token))
+                        headers=get_headers(token), timeout=REQUEST_TIMEOUT)
     if resp.status_code == 200:
         info = resp.json()
         results["token"] = {
@@ -804,11 +811,26 @@ def test_api_connection(token, collection_id):
 def search_item_by_slug(token, slug, collection_id):
     url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items"
     headers = get_headers(token)
-    offset = 0
-    limit = 100
 
+    # Fast path: server-side slug filter. Webflow v2 returns just the match.
+    resp = requests.get(url, headers=headers,
+                        params={"slug": slug, "limit": 1},
+                        timeout=REQUEST_TIMEOUT)
+    if resp.status_code == 200:
+        for item in resp.json().get("items", []):
+            if item.get("fieldData", {}).get("slug") == slug:
+                return item, None
+        # 200 but no match via filter → fall through to full scan in case the
+        # endpoint silently ignored the filter param on an older API version.
+    elif resp.status_code not in (400, 422):
+        return None, f"API Error {resp.status_code}: {resp.text}"
+
+    # Fallback: paginate.
+    offset, limit = 0, 100
     while True:
-        resp = requests.get(url, headers=headers, params={"offset": offset, "limit": limit})
+        resp = requests.get(url, headers=headers,
+                            params={"offset": offset, "limit": limit},
+                            timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200:
             return None, f"API Error {resp.status_code}: {resp.text}"
 
@@ -825,30 +847,10 @@ def search_item_by_slug(token, slug, collection_id):
     return None, f"No item found with slug: '{slug}'"
 
 
-def update_item_content(token, item_id, content_html, collection_id, live=False):
-    if live:
-        url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items/live"
-    else:
-        url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items"
-    headers = get_headers(token)
-
-    payload = {
-        "items": [{
-            "id": item_id,
-            "fieldData": {
-                "content": content_html
-            }
-        }]
-    }
-
-    resp = requests.patch(url, headers=headers, json=payload)
-    return resp
-
-
 def fetch_collection_schema(token, collection_id):
     """Return {'fields': [...], 'field_map': {slug: field_info}} for the collection."""
     resp = requests.get(f"{WEBFLOW_API_BASE}/collections/{collection_id}",
-                        headers=get_headers(token))
+                        headers=get_headers(token), timeout=REQUEST_TIMEOUT)
     if resp.status_code != 200:
         return None, f"HTTP {resp.status_code}: {resp.text}"
     data = resp.json()
@@ -866,6 +868,7 @@ def list_reference_options(token, ref_collection_id):
             f"{WEBFLOW_API_BASE}/collections/{ref_collection_id}/items",
             headers=get_headers(token),
             params={"offset": offset, "limit": 100},
+            timeout=REQUEST_TIMEOUT,
         )
         if resp.status_code != 200:
             return items, f"HTTP {resp.status_code}: {resp.text}"
@@ -993,7 +996,7 @@ def create_new_item(token, name, slug, content_html, collection_id, extra_fields
         }]
     }
 
-    resp = requests.post(url, headers=headers, json=payload)
+    resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
     return resp
 
 
@@ -1013,6 +1016,72 @@ def rich_text_bullets_to_html(text):
     if not items:
         return f'<p>{text}</p>'
     return '<ul>' + ''.join(f'<li>{item}</li>' for item in items) + '</ul>'
+
+
+FAQ_SECTION_OPEN = '<section class="faq" itemscope="" itemtype="https://schema.org/FAQPage">'
+FAQ_SECTION_CLOSE = '</section>'
+
+
+def _norm_field_name(s):
+    """Lowercase + strip non-alphanumerics for forgiving display-name matches."""
+    return re.sub(r'[^a-z0-9]+', '', str(s).lower())
+
+
+def is_faq_field(display_name):
+    """Forgiving match for the FAQ container field. Catches FAQ / FAQs /
+    FAQ's / FAQs Section / FAQ Section etc."""
+    n = _norm_field_name(display_name)
+    if not n:
+        return False
+    # Any normalized name that starts with 'faq' AND contains nothing other
+    # than 'faq' + optional 's' + optional 'section' / 'container'
+    if n in {"faq", "faqs", "faqsection", "faqssection",
+             "faqcontainer", "faqscontainer"}:
+        return True
+    return n.startswith("faq") and ("section" in n or n.endswith("s") or n == "faq")
+
+
+def is_trainer_paragraph_field(display_name):
+    """Trainer Paragraph stays as plain text. Catches 'Trainer Paragraph',
+    'Trainers Paragraph', 'Trainer Para', 'Trainers Para', etc."""
+    n = _norm_field_name(display_name)
+    if not n.startswith("trainer"):
+        return False
+    return ("paragraph" in n) or n.endswith("para") or n.endswith("paras")
+
+
+def wrap_faq_section(value):
+    """Wrap FAQ markup with the schema.org FAQPage section AND the Webflow
+    Rich Text embed wrapper. Webflow strips <section> from a Rich Text field
+    unless it sits inside a <div data-rt-embed-type='true'> block, which is
+    why a bare <section class='faq'> renders as empty in the Editor.
+    Idempotent — won't re-wrap content that's already in the final shape."""
+    if not value:
+        return value
+    stripped = value.strip()
+    low = stripped.lower()
+
+    has_embed_wrapper = 'data-rt-embed-type' in low[:120]
+    has_faq_section = 'schema.org/faqpage' in low
+
+    if has_embed_wrapper and has_faq_section:
+        return stripped  # already in final shape
+
+    if has_faq_section:
+        inner = stripped
+    else:
+        inner = f'{FAQ_SECTION_OPEN}\n{stripped}\n{FAQ_SECTION_CLOSE}'
+
+    return f'<div data-rt-embed-type="true">\n{inner}\n</div>'
+
+
+def plain_text_only(text):
+    """Strip ALL HTML and return bare text — for Webflow plain-text fields
+    that would otherwise display the markup as literal characters."""
+    if text is None:
+        return text
+    soup = BeautifulSoup(str(text), "html.parser")
+    return soup.get_text(separator=' ', strip=True)
 
 
 def parse_cms_fields_md(md_content):
@@ -1042,17 +1111,28 @@ def parse_cms_fields_md(md_content):
 
         field_name = parts[2].strip()
         input_type = parts[3].strip()
-        # Rejoin remaining columns so pipe chars inside content are preserved
-        content = '|'.join(parts[4:-1]).strip()
+        # Rejoin remaining columns so pipe chars inside content are preserved.
+        # If the line ended with a trailing `|`, parts[-1] is "" (empty post-split
+        # token) and we drop it; if it didn't, keep every column.
+        content_parts = parts[4:-1] if parts[-1].strip() == "" else parts[4:]
+        content = '|'.join(content_parts).strip()
 
         if not field_name:
             continue
 
-        if input_type == "Embedded (Custom Code)":
-            if content.startswith('`') and content.endswith('`'):
-                content = content[1:-1]
-        elif input_type == "Rich Text":
+        # Drop surrounding backticks if present (md code-fence) for any field.
+        if content.startswith('`') and content.endswith('`'):
+            content = content[1:-1]
+
+        # Convert semicolon-bullet markdown to <ul> ONLY for true list fields
+        # — never for fields that should stay plain-text. The actual decision
+        # is finalized at push time using the schema's field type; here we
+        # apply the conversion only for non-plain-text candidates.
+        if input_type == "Rich Text" and not is_trainer_paragraph_field(field_name):
             content = rich_text_bullets_to_html(content)
+
+        # Note: FAQ wrapping + trainer plain-text stripping happen later in the
+        # push pipeline, once we know the Webflow schema field type for sure.
 
         entries.append({
             "display_name": field_name,
@@ -1064,6 +1144,95 @@ def parse_cms_fields_md(md_content):
     return entries
 
 
+# ─── BLOCK PARSING (shared by all upload paths) ───────────────────────────────
+
+def parse_blocks(html_content):
+    """Parse already-wrapped HTML into the block dicts the UI consumes."""
+    soup = BeautifulSoup(html_content, "html.parser")
+    blocks_list = []
+    for element in soup.children:
+        if not isinstance(element, Tag):
+            continue
+        is_embed = element.get("data-rt-embed-type") == "true"
+        blocks_list.append({
+            "type": "embed" if is_embed else "plain",
+            "html": str(element),
+            "tag": element.name,
+            "preview": element.get_text()[:100].replace("\n", " ").strip(),
+            "chars": len(str(element)),
+        })
+    return blocks_list
+
+
+def safe_json(resp):
+    """Decode a Response body as JSON, falling back to a raw-text wrapper."""
+    try:
+        return resp.json()
+    except ValueError:
+        return {"_raw_body": resp.text}
+
+
+# ─── CREDENTIAL PERSISTENCE ───────────────────────────────────────────────────
+# Optional: stash token + collection ID in a local JSON file so the user
+# doesn't have to retype them on every reload / between course pushes.
+# Plaintext on disk — opt-in only.
+
+import os
+import pathlib
+
+CREDS_PATH = pathlib.Path.home() / ".webflow_publisher.json"
+
+
+def load_saved_creds():
+    """Return {'api_token': str, 'collection_id': str, 'remember': bool} or empty dict."""
+    try:
+        if CREDS_PATH.exists():
+            with open(CREDS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {
+                    "api_token": str(data.get("api_token", "")),
+                    "collection_id": str(data.get("collection_id", "")),
+                    "remember": bool(data.get("remember", False)),
+                }
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def save_creds(api_token, collection_id, remember):
+    """Persist (or clear) creds. remember=False writes an empty file shell."""
+    try:
+        if not remember:
+            if CREDS_PATH.exists():
+                CREDS_PATH.unlink()
+            return True, None
+        payload = {
+            "api_token": api_token or "",
+            "collection_id": collection_id or "",
+            "remember": True,
+        }
+        with open(CREDS_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        # Best-effort chmod 600 on POSIX; Windows ignores.
+        try:
+            os.chmod(CREDS_PATH, 0o600)
+        except OSError:
+            pass
+        return True, None
+    except OSError as e:
+        return False, str(e)
+
+
+def reset_push_state():
+    """Clear per-item session state so the user can push the next course
+    without reloading the page or re-entering credentials."""
+    keep_prefixes = ("collection_id", "saved_", "remember_creds")
+    for k in list(st.session_state.keys()):
+        if not any(k == kp or k.startswith(kp) for kp in keep_prefixes):
+            del st.session_state[k]
+
+
 # ─── STREAMLIT UI ─────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Edstellar → Webflow CMS Publisher", page_icon="🚀", layout="wide")
@@ -1071,22 +1240,65 @@ st.set_page_config(page_title="Edstellar → Webflow CMS Publisher", page_icon="
 st.title("🚀 Edstellar → Webflow CMS Publisher")
 st.caption("Upload HTML or CMS fields → Preview → Push to any Webflow collection")
 
+# Load saved creds once per session so reload / next-course doesn't lose them
+if "saved_creds_loaded" not in st.session_state:
+    saved = load_saved_creds()
+    st.session_state["saved_api_token"] = saved.get("api_token", "")
+    st.session_state["saved_collection_id"] = saved.get("collection_id", "")
+    st.session_state["remember_creds"] = saved.get("remember", False)
+    if saved.get("collection_id"):
+        st.session_state["collection_id"] = saved["collection_id"]
+    st.session_state["saved_creds_loaded"] = True
+
 # Sidebar
 with st.sidebar:
     st.header("⚙️ Settings")
-    api_token = st.text_input("Webflow API Token", type="password",
-                               help="Site API token with CMS edit+read scope")
+    api_token = st.text_input(
+        "Webflow API Token",
+        type="password",
+        value=st.session_state.get("saved_api_token", ""),
+        help="Site API token with CMS edit+read scope",
+        key="api_token_input",
+    )
 
     collection_id = st.text_input(
         "Collection ID",
         value=st.session_state.get("collection_id", ""),
         placeholder="e.g. 64ac3a242208dda62b6e6a90",
         help="Webflow CMS Collection ID — find it in Webflow Dashboard → CMS → [Collection] → Settings",
+        key="collection_id_input",
     )
     st.session_state["collection_id"] = collection_id
 
+    remember_creds = st.checkbox(
+        "💾 Remember on this machine",
+        value=st.session_state.get("remember_creds", False),
+        help=("Stores token + collection ID in plaintext at "
+              f"`{CREDS_PATH}` so reloads and next-course pushes don't "
+              "ask you to re-enter them. Untick to clear."),
+        key="remember_creds",
+    )
+    # Persist (or clear) whenever the checkbox or values change
+    prev = (st.session_state.get("saved_api_token", ""),
+            st.session_state.get("saved_collection_id", ""),
+            st.session_state.get("_prev_remember", None))
+    curr = (api_token, collection_id, remember_creds)
+    if curr != prev:
+        ok, err = save_creds(api_token, collection_id, remember_creds)
+        if ok:
+            st.session_state["saved_api_token"] = api_token if remember_creds else ""
+            st.session_state["saved_collection_id"] = collection_id if remember_creds else ""
+            st.session_state["_prev_remember"] = remember_creds
+        elif err:
+            st.warning(f"Couldn't save creds: {err}")
+
     push_live = st.checkbox("Push to Live (not just Draft)", value=False,
                              help="If checked, updates go live immediately")
+
+    if st.button("🔄 Push another item (reset)", use_container_width=True,
+                  help="Clears the current item / uploads but keeps your token and collection ID."):
+        reset_push_state()
+        st.rerun()
 
     # API Test button
     if api_token and collection_id:
@@ -1152,6 +1364,7 @@ new_primary_keyword = ""
 new_keyword_volume = 0
 new_format_blog = True
 new_faqs_section = True
+include_flag_fields = False
 
 if mode == "Update Existing Item":
     slug = st.text_input("🔗 Item Slug",
@@ -1186,14 +1399,14 @@ elif mode == "Create New Item":
     # Create new mode
     new_name = st.text_input("📝 Item Name*",
                               placeholder="11 Best Corporate Training Companies in Malaysia for 2026")
+    # Auto-generate slug from name if the slug field is empty
+    auto_slug_default = ""
+    if new_name:
+        auto_slug_default = re.sub(r'[^a-z0-9]+', '-', new_name.lower()).strip('-')
     new_slug = st.text_input("🔗 Slug*",
+                              value=auto_slug_default,
                               placeholder="corporate-training-companies-malaysia",
-                              help="URL slug — lowercase, hyphens, no spaces")
-
-    # Auto-generate slug from name
-    if new_name and not new_slug:
-        auto_slug = re.sub(r'[^a-z0-9]+', '-', new_name.lower()).strip('-')
-        st.caption(f"Auto-slug: `{auto_slug}`")
+                              help="URL slug — lowercase, hyphens, no spaces. Auto-filled from name; edit if you want a custom slug.")
 
     with st.expander("Optional Fields"):
         new_meta_title = st.text_input("Meta Title", placeholder="Same as title if blank")
@@ -1201,7 +1414,13 @@ elif mode == "Create New Item":
         new_description = st.text_area("Description (excerpt)", placeholder="Short excerpt for listings", max_chars=500)
         new_canonical = st.text_input("Canonical URL", placeholder="https://www.edstellar.com/your-slug")
         new_primary_keyword = st.text_input("Primary Keyword", placeholder="corporate training companies malaysia")
-        new_keyword_volume = st.number_input("Keyword Search Volume", min_value=0, value=0)
+        new_keyword_volume = st.number_input("Keyword Search Volume", min_value=0, value=0,
+                                              help="Pushed only when > 0")
+        include_flag_fields = st.checkbox(
+            "Include 'New Format Blog' / 'FAQS Section' flags in payload",
+            value=False,
+            help="Leave off to skip these booleans entirely (collection defaults apply).",
+        )
         new_format_blog = st.checkbox("New Format Blog", value=True)
         new_faqs_section = st.checkbox("FAQS Section", value=True)
 
@@ -1369,6 +1588,34 @@ if mode == "Push CMS Fields (.md)":
                 warnings_list.append(f"**{display}** (`{real_slug}`): {warn}")
             if resolved is None:
                 continue
+
+            # ── Schema-type-aware post-processing ────────────────────────
+            # This is the source of truth — name-matching alone misses
+            # plural/apostrophe variants and gets fooled by similar fields.
+            f_info = field_map[real_slug]
+            f_type = f_info.get("type", "")
+            schema_dn = f_info.get("displayName") or f_info.get("name") or ""
+
+            # Plain-text fields (PlainText, Email, Link, Phone): Webflow
+            # renders the value as literal characters, so strip ALL markup.
+            # This catches Trainer Paragraph regardless of how it was named.
+            if f_type in {"PlainText", "Email", "Link", "Phone"} and isinstance(resolved, str):
+                resolved = plain_text_only(resolved)
+            # Belt-and-suspenders: trainer paragraph by name, in case the
+            # schema mis-types the field as RichText but it's actually plain.
+            elif is_trainer_paragraph_field(display) or is_trainer_paragraph_field(schema_dn):
+                if isinstance(resolved, str):
+                    resolved = plain_text_only(resolved)
+
+            # FAQ container — wrap in <div data-rt-embed-type="true"><section
+            # class="faq" itemscope itemtype="schema.org/FAQPage">…</section>
+            # </div>. Webflow strips bare <section> tags from Rich Text, so
+            # the embed wrapper is required for the FAQ to render.
+            if (f_type == "RichText"
+                    and (is_faq_field(display) or is_faq_field(schema_dn))
+                    and isinstance(resolved, str)):
+                resolved = wrap_faq_section(resolved)
+
             resolved_data[real_slug] = resolved
 
         # Persist ref lookups so subsequent rerenders skip the API calls
@@ -1498,13 +1745,13 @@ if mode == "Push CMS Fields (.md)":
                             else:
                                 url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items"
                             payload = {"items": [{"id": item_id, "fieldData": field_data}]}
-                            resp = requests.patch(url, headers=get_headers(api_token), json=payload)
+                            resp = requests.patch(url, headers=get_headers(api_token), json=payload, timeout=REQUEST_TIMEOUT)
 
                         if resp.status_code == 200:
                             st.success("✅ Updated successfully!")
                             st.balloons()
                             with st.expander("API Response"):
-                                st.json(resp.json())
+                                st.json(safe_json(resp))
                         else:
                             st.error(f"❌ Failed — HTTP {resp.status_code}")
                             st.code(resp.text, language="json")
@@ -1536,12 +1783,12 @@ if mode == "Push CMS Fields (.md)":
                         with st.spinner("Updating…"):
                             patch_url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items"
                             patch_payload = {"items": [{"id": item_id, "fieldData": field_data}]}
-                            resp = requests.patch(patch_url, headers=get_headers(api_token), json=patch_payload)
+                            resp = requests.patch(patch_url, headers=get_headers(api_token), json=patch_payload, timeout=REQUEST_TIMEOUT)
                         if resp.status_code == 200:
                             st.success(f"✅ Updated '{existing_name}' successfully!")
                             st.balloons()
                             with st.expander("API Response"):
-                                st.json(resp.json())
+                                st.json(safe_json(resp))
                         else:
                             st.error(f"❌ Update failed — HTTP {resp.status_code}")
                             st.code(resp.text, language="json")
@@ -1550,12 +1797,12 @@ if mode == "Push CMS Fields (.md)":
                         with st.spinner("Creating new item…"):
                             url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items"
                             payload = {"items": [{"fieldData": field_data, "isDraft": True}]}
-                            resp = requests.post(url, headers=get_headers(api_token), json=payload)
+                            resp = requests.post(url, headers=get_headers(api_token), json=payload, timeout=REQUEST_TIMEOUT)
                         if resp.status_code in (200, 201, 202):
                             st.success("✅ Item created as Draft!")
                             st.balloons()
                             with st.expander("API Response"):
-                                st.json(resp.json())
+                                st.json(safe_json(resp))
                         else:
                             st.error(f"❌ Failed — HTTP {resp.status_code}")
                             st.code(resp.text, language="json")
@@ -1580,21 +1827,7 @@ if upload_type == "Webflow-Ready HTML (direct push)":
         st.caption(f"Loaded **{uploaded_file.name}** — {len(raw_html):,} characters")
 
         # Parse directly — no conversion needed
-        block_soup = BeautifulSoup(raw_html, "html.parser")
-        blocks_list = []
-        for element in block_soup.children:
-            if isinstance(element, NavigableString):
-                continue
-            if not isinstance(element, Tag):
-                continue
-            is_embed = element.get("data-rt-embed-type") == "true"
-            blocks_list.append({
-                "type": "embed" if is_embed else "plain",
-                "html": str(element),
-                "tag": element.name,
-                "preview": element.get_text()[:100].replace("\n", " ").strip(),
-                "chars": len(str(element)),
-            })
+        blocks_list = parse_blocks(raw_html)
 
         st.session_state["blocks"] = blocks_list
         st.success(f"✅ {len(blocks_list)} blocks loaded directly (no conversion)")
@@ -1635,21 +1868,7 @@ elif upload_type == "Raw HTML (auto-converts)":
                 processed_html, stats = classify_and_wrap(raw_html)
 
                 # Parse into individual blocks
-                block_soup = BeautifulSoup(processed_html, "html.parser")
-                all_blocks = []
-                for element in block_soup.children:
-                    if isinstance(element, NavigableString):
-                        continue
-                    if not isinstance(element, Tag):
-                        continue
-                    is_embed = element.get("data-rt-embed-type") == "true"
-                    all_blocks.append({
-                        "type": "embed" if is_embed else "plain",
-                        "html": str(element),
-                        "tag": element.name,
-                        "preview": element.get_text()[:100].replace("\n", " ").strip(),
-                        "chars": len(str(element)),
-                    })
+                all_blocks = parse_blocks(processed_html)
 
                 # Filter blocks based on selected H2s
                 selected_h2s = st.session_state.get("selected_h2s", h2_texts)
@@ -1696,21 +1915,7 @@ else:  # CSV (pre-formatted)
         st.caption(f"Loaded **{uploaded_csv.name}** — {len(rows)} blocks, {len(csv_content):,} characters")
 
         # Parse into blocks for display
-        block_soup = BeautifulSoup(csv_content, "html.parser")
-        blocks_list = []
-        for element in block_soup.children:
-            if isinstance(element, NavigableString):
-                continue
-            if not isinstance(element, Tag):
-                continue
-            is_embed = element.get("data-rt-embed-type") == "true"
-            blocks_list.append({
-                "type": "embed" if is_embed else "plain",
-                "html": str(element),
-                "tag": element.name,
-                "preview": element.get_text()[:100].replace("\n", " ").strip(),
-                "chars": len(str(element)),
-            })
+        blocks_list = parse_blocks(csv_content)
 
         st.session_state["blocks"] = blocks_list
         st.session_state["processed_html"] = csv_content
@@ -1880,13 +2085,13 @@ if "blocks" in st.session_state:
                                 "fieldData": update_fields
                             }]
                         }
-                        resp = requests.patch(url, headers=get_headers(api_token), json=payload)
+                        resp = requests.patch(url, headers=get_headers(api_token), json=payload, timeout=REQUEST_TIMEOUT)
 
                     if resp.status_code == 200:
                         st.success("✅ Updated successfully!")
                         st.balloons()
                         with st.expander("API Response"):
-                            st.json(resp.json())
+                            st.json(safe_json(resp))
                     else:
                         st.error(f"❌ Failed — HTTP {resp.status_code}")
                         st.code(resp.text, language="json")
@@ -1911,8 +2116,9 @@ if "blocks" in st.session_state:
                 extra["primary-keyword"] = new_primary_keyword
             if new_keyword_volume:
                 extra["keyword-search-volume"] = new_keyword_volume
-            extra["new-format-blog"] = new_format_blog
-            extra["faqs-section"] = new_faqs_section
+            if include_flag_fields:
+                extra["new-format-blog"] = new_format_blog
+                extra["faqs-section"] = new_faqs_section
 
             st.info(f"**Create:** {new_name}\n\nSlug: `{new_slug}` | Content: {total_chars:,} chars | Status: Draft")
 
@@ -1929,7 +2135,7 @@ if "blocks" in st.session_state:
                         st.success("✅ Item created as Draft!")
                         st.balloons()
                         with st.expander("API Response"):
-                            st.json(resp.json())
+                            st.json(safe_json(resp))
                     else:
                         st.error(f"❌ Failed — HTTP {resp.status_code}")
                         st.code(resp.text, language="json")
