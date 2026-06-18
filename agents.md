@@ -32,7 +32,8 @@ No test suite yet. Pure helpers worth covering when one gets added:
 `split_into_blocks`, `convert_company_profile`, `convert_eval_grid`,
 `convert_faq_details`, `convert_quotes_to_single`, `parse_cms_fields_md`,
 `wrap_faq_section`, `plain_text_only`, `is_faq_field`,
-`is_trainer_paragraph_field`.
+`is_trainer_paragraph_field`, `match_entry_to_slug`,
+`apply_field_type_transforms`, `resolve_md_to_field_data`, `push_items_bulk`.
 
 ## Env / credentials
 - **Webflow API token** + **collection ID** entered in the sidebar.
@@ -50,12 +51,24 @@ No test suite yet. Pure helpers worth covering when one gets added:
 - Don't add `--no-verify` to commits or push to a shared remote without asking.
 - Don't broaden `is_embed_block` further — it already treats any classed `<div>`
   as an embed; widening it more will start wrapping decorative wrappers.
+- Don't raise the **bulk-mode 5-file cap** without thinking about: rate limits
+  (each file = 1 slug-lookup GET + Webflow's 60 req/min budget shared across
+  the token), partial-failure UX (one error row per file becomes unreadable
+  past ~10), and the parsing loop being synchronous Streamlit code.
 
 ### Watch out for
 - **Field-type-aware transforms run AFTER schema resolution** — adding new
-  rules belongs in the UI's resolve loop, not in `parse_cms_fields_md`.
-  Reason: `parse_cms_fields_md` doesn't yet know what Webflow says the field
-  type is.
+  rules belongs in `apply_field_type_transforms()`, not in
+  `parse_cms_fields_md`. Reason: the latter doesn't know what Webflow says
+  the field type is. `apply_field_type_transforms` is called by
+  `resolve_md_to_field_data` and reused by both single + bulk push.
+- **Bulk push pipeline** (`resolve_md_to_field_data` → `push_items_bulk`) is
+  the shared backbone. Webflow's bulk endpoints are **not transactional** —
+  partial success is normal; the per-item result dicts must surface that.
+- **Bulk-mode default-skip set** (`DEFAULT_SKIP_FIELDS`) is module-level now.
+  The legacy in-UI duplicate inside the single-file Push mode is harmless
+  (Python scoping shadows it with an identical value); when you next touch
+  that block, prefer the module-level set.
 - **FAQ wrap is idempotent** — re-pushing must not double-wrap. The check looks
   at the first ~120 chars for `data-rt-embed-type` and the whole string for
   `schema.org/faqpage`.
@@ -66,6 +79,9 @@ No test suite yet. Pure helpers worth covering when one gets added:
 - **`search_item_by_slug` tries the `?slug=` filter first** then falls back to
   pagination. Don't remove the fallback — some Webflow API revisions ignore
   the filter param.
+- **`push_items_bulk` chunks at 100 items** because Webflow's bulk endpoints
+  cap there. Bulk mode currently sends ≤5 per call; the chunking only kicks
+  in if the file cap is ever raised.
 
 ### Known fragile spots
 - The "any classed `<div>` is an embed" rule (`is_embed_block`) — by design,

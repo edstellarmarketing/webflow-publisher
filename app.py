@@ -1233,6 +1233,170 @@ def reset_push_state():
             del st.session_state[k]
 
 
+# ─── CMS-FIELDS PIPELINE (shared by single + bulk push) ───────────────────────
+
+# Fields that DEFAULT to "skip" (unticked) in the single-file push selector,
+# and that bulk-Update mode also skips by default to avoid clobbering identity.
+DEFAULT_SKIP_FIELDS = {
+    "name", "slug",
+    "canonical", "canonicallinks", "canonicalurl",
+    "coursename",
+    "deliverytype",
+    "duration",
+    "whichcourselevel",
+    "whichcoursetype",
+    "whichcoursecategory",
+    "whichcoursesubcategory",
+}
+
+
+def _norm_name(s):
+    """Lowercase + drop non-alphanumerics — used for forgiving display-name matches."""
+    return re.sub(r'[^a-z0-9]+', '', str(s).strip().lower())
+
+
+def build_display_to_slug(field_map):
+    """Return {normalized-display-name: slug}, indexed by display name and slug."""
+    dts = {}
+    for fslug, finfo in field_map.items():
+        dn = finfo.get("displayName") or finfo.get("name") or ""
+        if dn:
+            dts[_norm_name(dn)] = fslug
+        dts.setdefault(_norm_name(fslug), fslug)
+    return dts
+
+
+def match_entry_to_slug(entry, field_map, display_to_slug):
+    """Resolve a parsed .md entry to a real schema slug. Returns slug or None."""
+    norm = _norm_name(entry["display_name"])
+    real = display_to_slug.get(norm)
+    if not real and entry["slug_guess"] in field_map:
+        real = entry["slug_guess"]
+    if not real:
+        best = None
+        for known_norm, known_slug in display_to_slug.items():
+            if known_norm and (known_norm in norm or norm in known_norm):
+                if best is None or len(known_norm) > len(best[0]):
+                    best = (known_norm, known_slug)
+        if best:
+            real = best[1]
+    return real
+
+
+def apply_field_type_transforms(value, field_info, display_name):
+    """Schema-type-aware post-processing applied right before push.
+    PlainText/Email/Link/Phone → strip HTML; RichText + FAQ name → wrap;
+    RichText + Trainer Paragraph name → strip HTML."""
+    if not isinstance(value, str):
+        return value
+    f_type = field_info.get("type", "")
+    schema_dn = field_info.get("displayName") or field_info.get("name") or ""
+
+    if f_type in {"PlainText", "Email", "Link", "Phone"}:
+        return plain_text_only(value)
+    if is_trainer_paragraph_field(display_name) or is_trainer_paragraph_field(schema_dn):
+        return plain_text_only(value)
+    if f_type == "RichText" and (is_faq_field(display_name) or is_faq_field(schema_dn)):
+        return wrap_faq_section(value)
+    return value
+
+
+def resolve_md_to_field_data(api_token, parsed_entries, field_map, ref_cache):
+    """Run a parsed .md (list of entries) through schema matching, value
+    resolution, and field-type-aware post-processing. Returns a dict:
+    {real_slug: resolved_value} plus a list of (display_name, real_slug,
+    default_skip) match records and a list of resolution warnings."""
+    display_to_slug = build_display_to_slug(field_map)
+    resolved_data, matches, warnings_list = {}, [], []
+
+    for entry in parsed_entries:
+        display = entry["display_name"]
+        real_slug = match_entry_to_slug(entry, field_map, display_to_slug)
+
+        schema_norm = ""
+        if real_slug:
+            schema_dn = field_map[real_slug].get("displayName") or field_map[real_slug].get("name") or ""
+            schema_norm = _norm_name(schema_dn)
+        default_skip = (
+            _norm_name(display) in DEFAULT_SKIP_FIELDS
+            or schema_norm in DEFAULT_SKIP_FIELDS
+            or _norm_name(real_slug or "") in DEFAULT_SKIP_FIELDS
+        )
+
+        matches.append((entry, real_slug, default_skip))
+        if not real_slug:
+            continue
+
+        resolved, warn = resolve_field_value(
+            api_token, field_map[real_slug], entry["value"], ref_cache
+        )
+        if warn:
+            warnings_list.append(f"**{display}** (`{real_slug}`): {warn}")
+        if resolved is None:
+            continue
+
+        resolved = apply_field_type_transforms(resolved, field_map[real_slug], display)
+        resolved_data[real_slug] = resolved
+
+    return resolved_data, matches, warnings_list
+
+
+def push_items_bulk(api_token, collection_id, create_items, update_items, live=False):
+    """Send create + update payloads to Webflow. Returns a list of per-item
+    result dicts: {label, action, status, slug, item_id, error}. Webflow
+    accepts up to 100 items per call — we chunk just in case the caller
+    passes more."""
+    suffix = "/live" if live else ""
+    headers = get_headers(api_token)
+    results = []
+
+    def _chunks(lst, n):
+        for i in range(0, len(lst), n):
+            yield lst[i:i+n]
+
+    # ── Updates: PATCH /items[ /live ] ──────────────────────────────────
+    for chunk in _chunks(update_items, 100):
+        url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items{suffix}"
+        payload = {"items": [{"id": it["item_id"], "fieldData": it["field_data"]}
+                              for it in chunk]}
+        try:
+            resp = requests.patch(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
+            ok = resp.status_code == 200
+            body = safe_json(resp)
+        except requests.RequestException as e:
+            ok, body = False, {"error": str(e)}
+        for it in chunk:
+            results.append({
+                "label": it["label"], "action": "update",
+                "slug": it["slug"], "item_id": it["item_id"],
+                "status": "✅" if ok else "❌",
+                "error": "" if ok else json.dumps(body)[:400],
+            })
+
+    # ── Creates: POST /items (always Draft) ─────────────────────────────
+    for chunk in _chunks(create_items, 100):
+        url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items"
+        payload = {"items": [{"fieldData": it["field_data"], "isDraft": True}
+                              for it in chunk]}
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
+            ok = resp.status_code in (200, 201, 202)
+            body = safe_json(resp)
+        except requests.RequestException as e:
+            ok, body = False, {"error": str(e)}
+        created_items = body.get("items", []) if isinstance(body, dict) and ok else []
+        for idx, it in enumerate(chunk):
+            new_id = created_items[idx].get("id") if idx < len(created_items) else ""
+            results.append({
+                "label": it["label"], "action": "create",
+                "slug": it["slug"], "item_id": new_id,
+                "status": "✅" if ok else "❌",
+                "error": "" if ok else json.dumps(body)[:400],
+            })
+
+    return results
+
+
 # ─── STREAMLIT UI ─────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Edstellar → Webflow CMS Publisher", page_icon="🚀", layout="wide")
@@ -1346,11 +1510,19 @@ with st.sidebar:
     **Content types:**
     - 🟢 Plain rich text → as-is
     - 🟡 Embed → wrapped with `data-rt-embed-type`
+
+    **Bulk mode:** pick *Bulk Push CMS Fields (.md, up to 5)*
+    to upload 1–5 .md files and push them in one batch.
     """)
 
 # Slug input
 # Mode selector
-mode = st.radio("📋 Mode", ["Update Existing Item", "Create New Item", "Push CMS Fields (.md)"], horizontal=True)
+mode = st.radio(
+    "📋 Mode",
+    ["Update Existing Item", "Create New Item", "Push CMS Fields (.md)",
+     "Bulk Push CMS Fields (.md, up to 5)"],
+    horizontal=True,
+)
 
 # Initialize variables for both modes
 slug = ""
@@ -1806,6 +1978,246 @@ if mode == "Push CMS Fields (.md)":
                         else:
                             st.error(f"❌ Failed — HTTP {resp.status_code}")
                             st.code(resp.text, language="json")
+
+    st.stop()
+
+# ── Bulk Push CMS Fields (.md) mode ───────────────────────────────────────────
+if mode == "Bulk Push CMS Fields (.md, up to 5)":
+    st.divider()
+    st.subheader("📋 Bulk Push CMS Fields — up to 5 files at once")
+
+    if not api_token or not collection_id:
+        st.warning("Enter your Webflow API token and Collection ID in the sidebar.")
+        st.stop()
+
+    bulk_files = st.file_uploader(
+        "Upload 1–5 CMS Fields .md files",
+        type=["md"], accept_multiple_files=True,
+        help="Each file is parsed against the same collection schema, then pushed as one item.",
+    )
+
+    if not bulk_files:
+        st.info("Upload between 1 and 5 .md files. Larger batches are intentionally blocked — split into runs.")
+        st.stop()
+
+    if len(bulk_files) > 5:
+        st.error(f"Got {len(bulk_files)} files. This mode is capped at **5 per run** to keep the diff "
+                  "auditable and rate-limit risk low. Remove some and re-upload.")
+        st.stop()
+
+    # ── Schema + reference cache (shared across all files) ────────────────
+    schema_key = f"schema_{collection_id}"
+    if schema_key not in st.session_state:
+        with st.spinner("Loading collection schema…"):
+            schema, schema_err = fetch_collection_schema(api_token, collection_id)
+        if schema_err:
+            st.error(f"Failed to load schema: {schema_err}")
+            st.stop()
+        st.session_state[schema_key] = schema
+    schema = st.session_state[schema_key]
+    field_map = schema["field_map"]
+
+    ref_cache = st.session_state.get(f"ref_cache_{collection_id}", {})
+
+    bulk_action = st.radio(
+        "Action for all files",
+        ["Upsert (update if slug exists, else create as Draft)",
+         "Update only (skip files whose slug isn't in the collection)",
+         "Create only (always Draft; refuse files whose slug already exists)"],
+        index=0, key="bulk_action",
+    )
+    include_identity = st.checkbox(
+        "Include identity / structural fields (Name, Slug, Course Level/Type/…)",
+        value=bulk_action.startswith("Create"),
+        help="Create needs them; Update should usually skip them to avoid clobbering.",
+        key="bulk_include_identity",
+    )
+
+    # ── Parse + resolve every file up front, build push-payload preview ──
+    plans = []  # list of dicts {filename, slug, name, field_data, matches, warnings, lookup_err, existing}
+    progress = st.progress(0.0, text="Parsing files…")
+    for i, f in enumerate(bulk_files):
+        md_content = f.read().decode("utf-8")
+        parsed = parse_cms_fields_md(md_content)
+
+        if not parsed:
+            plans.append({"filename": f.name, "error": "No fields parsed — check table format."})
+            progress.progress((i + 1) / len(bulk_files), text=f"Parsed {f.name}")
+            continue
+
+        full_resolved, matches, warnings_list = resolve_md_to_field_data(
+            api_token, parsed, field_map, ref_cache
+        )
+
+        # Apply identity/structural skip rule unless the user opted in.
+        # Always retain name + slug — Create needs them; Update tolerates them
+        # (they'll match the existing record).
+        if include_identity:
+            resolved = dict(full_resolved)
+        else:
+            resolved = {}
+            for k, v in full_resolved.items():
+                schema_norm = _norm_name(field_map[k].get("displayName") or k)
+                is_identity = (schema_norm in DEFAULT_SKIP_FIELDS
+                               or _norm_name(k) in DEFAULT_SKIP_FIELDS)
+                if (not is_identity) or k in ("name", "slug"):
+                    resolved[k] = v
+
+        slug_val = resolved.get("slug", "")
+        name_val = resolved.get("name", "")
+
+        # Check if slug exists already (one round-trip per file; acceptable for ≤5).
+        existing, lookup_err = (None, None)
+        if slug_val:
+            existing, lookup_err = search_item_by_slug(api_token, slug_val, collection_id)
+
+        plans.append({
+            "filename": f.name,
+            "slug": slug_val,
+            "name": name_val,
+            "field_data": resolved,
+            "matches": matches,
+            "warnings": warnings_list,
+            "existing": existing,
+            "lookup_err": lookup_err if not existing else None,
+        })
+        progress.progress((i + 1) / len(bulk_files), text=f"Parsed {f.name}")
+    progress.empty()
+
+    # Persist ref cache for subsequent reruns
+    st.session_state[f"ref_cache_{collection_id}"] = ref_cache
+
+    # ── Plan + selection table ───────────────────────────────────────────
+    push_create, push_update, skipped = [], [], []
+    st.markdown("### 🧾 Push plan")
+    for idx, p in enumerate(plans):
+        if "error" in p:
+            with st.expander(f"❌ **{p['filename']}** — parse error", expanded=False):
+                st.error(p["error"])
+            skipped.append({"label": p["filename"], "reason": p["error"]})
+            continue
+
+        existing = p["existing"]
+        if bulk_action.startswith("Update") and not existing:
+            decision = "skip"
+            reason = "slug not found — Update-only mode"
+        elif bulk_action.startswith("Create") and existing:
+            decision = "skip"
+            reason = f"slug already exists (id `{existing['id']}`) — Create-only mode"
+        elif existing:
+            decision = "update"
+            reason = f"slug exists (id `{existing['id']}`) — will PATCH"
+        else:
+            decision = "create"
+            reason = "slug not found — will POST as Draft"
+
+        tag = {"create": "🆕 CREATE", "update": "♻️ UPDATE", "skip": "⏭️ SKIP"}[decision]
+        unmatched = [e["display_name"] for e, s, _ in p["matches"] if not s]
+
+        header = (f"{tag}  ·  **{p['filename']}**  ·  "
+                  f"`{p['slug'] or '—'}`  ·  "
+                  f"{len(p['field_data'])} fields"
+                  + (f"  ·  ⚠️ {len(unmatched)} unmatched" if unmatched else "")
+                  + (f"  ·  ⚠️ {len(p['warnings'])} warnings" if p["warnings"] else ""))
+
+        with st.expander(header, expanded=False):
+            meta_a, meta_b = st.columns([2, 3])
+            with meta_a:
+                st.markdown(f"**Slug:** `{p['slug'] or '—'}`")
+                st.markdown(f"**Name:** {p['name'] or '—'}")
+                st.markdown(f"**Decision:** {tag}")
+                st.caption(reason)
+                if p.get("lookup_err"):
+                    st.caption(f"slug lookup: {p['lookup_err']}")
+            with meta_b:
+                st.markdown(f"**Fields ready to push ({len(p['field_data'])})**")
+                # Compact list of {schema display name → value preview}
+                for fslug, fval in p["field_data"].items():
+                    schema_dn = field_map[fslug].get("displayName") or fslug
+                    preview = str(fval)
+                    if len(preview) > 120:
+                        preview = preview[:120] + "…"
+                    preview = preview.replace("\n", " ")
+                    st.caption(f"• **{schema_dn}** (`{fslug}`) — {preview}")
+
+            if unmatched:
+                st.markdown(f"**⚠️ Unmatched .md fields ({len(unmatched)}) — no schema match**")
+                for u in unmatched:
+                    st.caption(f"· _{u}_")
+
+            if p["warnings"]:
+                st.markdown(f"**⚠️ Resolution warnings ({len(p['warnings'])})**")
+                for w in p["warnings"]:
+                    st.caption(w)
+
+        item = {
+            "label": p["filename"],
+            "slug": p["slug"],
+            "name": p["name"],
+            "field_data": p["field_data"],
+            "item_id": existing["id"] if existing else "",
+        }
+        if decision == "create":
+            push_create.append(item)
+        elif decision == "update":
+            push_update.append(item)
+        else:
+            skipped.append({"label": p["filename"], "reason": reason})
+
+    st.divider()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("🆕 To create", len(push_create))
+    c2.metric("♻️ To update", len(push_update))
+    c3.metric("⏭️ Skipped", len(skipped))
+
+    target_label = "**LIVE**" if push_live else "**Draft (staged)**"
+    st.info(f"Target: {target_label} · Collection: `{collection_id}`")
+
+    if not (push_create or push_update):
+        st.warning("Nothing to push. Adjust your mode or upload different files.")
+        st.stop()
+
+    confirm = st.checkbox(
+        f"I confirm: push {len(push_create) + len(push_update)} item(s) "
+        f"({len(push_create)} create / {len(push_update)} update).",
+        key="bulk_confirm",
+    )
+    if confirm:
+        if st.button("🚀 Push All", type="primary", use_container_width=True, key="bulk_push_btn"):
+            with st.spinner("Pushing batch to Webflow…"):
+                results = push_items_bulk(
+                    api_token, collection_id,
+                    create_items=push_create,
+                    update_items=push_update,
+                    live=push_live,
+                )
+
+            ok = [r for r in results if r["status"] == "✅"]
+            bad = [r for r in results if r["status"] == "❌"]
+
+            if ok and not bad:
+                st.success(f"✅ Pushed {len(ok)} / {len(ok)} items.")
+                st.balloons()
+            elif ok and bad:
+                st.warning(f"Partial success: {len(ok)} ok, {len(bad)} failed.")
+            else:
+                st.error(f"All {len(bad)} push(es) failed.")
+
+            st.markdown("### 📋 Per-item result")
+            for r in results:
+                line = (f"{r['status']} **{r['label']}** — `{r['action']}` "
+                        f"slug `{r['slug'] or '—'}` "
+                        f"id `{r['item_id'] or '—'}`")
+                st.markdown(line)
+                if r["error"]:
+                    with st.expander("error detail"):
+                        st.code(r["error"], language="json")
+
+            if skipped:
+                with st.expander(f"⏭️ Skipped ({len(skipped)}) — not pushed by design"):
+                    for s in skipped:
+                        st.caption(f"**{s['label']}** — {s['reason']}")
 
     st.stop()
 

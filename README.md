@@ -14,7 +14,7 @@ schema without touching the Designer.
 
 ## What it does
 
-Three input formats, one push pipeline:
+Five input formats, one push pipeline:
 
 | Mode | Source | Behavior |
 |------|--------|----------|
@@ -22,6 +22,7 @@ Three input formats, one push pipeline:
 | **Webflow-Ready HTML (direct push)** | HTML already formatted with `data-rt-embed-type` wrappers | Parsed into blocks for inline editing, then pushed as-is. |
 | **CSV (pre-formatted)** | CSV with a `content` column | Rows concatenated, parsed into blocks. |
 | **Push CMS Fields (.md)** | Markdown table mapping CMS field name → input type → value | Fetches the live collection schema, fuzzy-matches each row to a real field slug, resolves Option/Reference values via the API, applies type-aware transformations, then pushes only the rows you tick. |
+| **Bulk Push CMS Fields (.md, up to 5)** | 1–5 .md files at once | Same pipeline as single Push CMS Fields, batched: schema fetched once, reference lookups cached across all files, all updates sent in one `PATCH /items`, all creates in one `POST /items`. Per-file expander with field preview, per-item ✅/❌ result table. |
 
 Built-in support for:
 - **H2 section selection** — preview the article's H2s and untick the ones you don't want pushed.
@@ -123,6 +124,56 @@ These run automatically after schema lookup — **no need to configure**:
 
 Pattern matching is forgiving: plural ("Trainers"), apostrophe ("FAQ's"), short-form ("Trainers Para") all match.
 
+### 5. Bulk Push CMS Fields (.md, up to 5)
+
+Same pipeline as **Push CMS Fields (.md)**, batched. Drag-and-drop 1–5 `.md`
+files at once. The 5-file cap is enforced client-side — bypassing it would
+risk rate-limit issues and make partial failures harder to audit.
+
+**Action selector (applies to the whole batch):**
+
+| Action | Behavior |
+|--------|----------|
+| **Upsert** *(default)* | Update if the slug exists, else create as Draft. |
+| **Update only** | Skip files whose slug isn't already in the collection. |
+| **Create only** | Refuse files whose slug already exists. |
+
+**"Include identity / structural fields" checkbox** — defaults to on for
+Create, off for Update (matches single-file behavior). Name + Slug always
+flow through regardless, since both Create and Update need them.
+
+**Per-file expander under 🧾 Push plan**
+
+Each file collapses to a one-line header summarizing the key signals:
+
+```
+🆕 CREATE  ·  course-1.md  ·  corporate-training-malaysia  ·  18 fields
+♻️ UPDATE  ·  course-2.md  ·  burnout-prevention            ·  22 fields  ·  ⚠️ 3 warnings
+⏭️ SKIP    ·  course-3.md  ·  dup-slug                      ·  20 fields
+```
+
+Open one to inspect: slug, name, decision reason, every field that will be
+pushed with a 120-char value preview, unmatched .md columns, and resolution
+warnings.
+
+**Performance**
+
+- Schema fetched once per collection — not per file.
+- Reference-collection items cached in `st.session_state[f"ref_cache_{id}"]`,
+  reused across every file in the batch.
+- Maximum **2 write calls** per batch: one `PATCH /items` (or `/items/live`)
+  for all updates, one `POST /items` for all creates. Webflow accepts ≤100
+  items per call; the chunker handles larger batches if you ever raise the
+  5-file cap.
+- Slug-existence check still runs once per file (≤5 GETs per batch).
+
+**Failure handling**
+
+Webflow's per-item response is preserved. The result table shows ✅/❌ for
+each file independently; opening an ❌ row reveals the raw API error JSON.
+Partial success is expected (Webflow's bulk endpoints are **not**
+transactional) and clearly surfaced.
+
 ---
 
 ## File layout
@@ -160,12 +211,12 @@ parsing helpers → credential persistence → Streamlit UI.
 
 | Endpoint | Used for |
 |----------|----------|
-| `GET /collections/{id}` | Fetch schema (field list, types, validations). |
+| `GET /collections/{id}` | Fetch schema (field list, types, validations). Result cached per session. |
 | `GET /collections/{id}/items?slug={slug}` | Find item by slug (fast path). |
-| `GET /collections/{id}/items?offset=…` | Paginated fallback for slug search. |
-| `GET /collections/{ref_id}/items` | List referenced-collection items (for Reference / MultiReference resolution). |
-| `POST /collections/{id}/items` | Create draft item. |
-| `PATCH /collections/{id}/items` | Update staged content. |
+| `GET /collections/{id}/items?offset=…` | Paginated fallback for slug search if the filter param is ignored. |
+| `GET /collections/{ref_id}/items` | List referenced-collection items (for Reference / MultiReference resolution). Cached per session. |
+| `POST /collections/{id}/items` | Create draft item. Bulk mode sends all creates in one call (≤100 items, chunked). |
+| `PATCH /collections/{id}/items` | Update staged content. Bulk mode sends all updates in one call. |
 | `PATCH /collections/{id}/items/live` | Update + publish live. |
 | `GET /token/introspect` | Show token type during the connection test. |
 
