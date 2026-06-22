@@ -974,7 +974,8 @@ def resolve_field_value(token, field_info, raw_value, ref_cache):
     return raw_value, None
 
 
-def create_new_item(token, name, slug, content_html, collection_id, extra_fields=None):
+def create_new_item(token, name, slug, content_html, collection_id, extra_fields=None,
+                    content_field="content"):
     """Create a new item in the collection."""
     url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items"
     headers = get_headers(token)
@@ -982,7 +983,7 @@ def create_new_item(token, name, slug, content_html, collection_id, extra_fields
     field_data = {
         "name": name,
         "slug": slug,
-        "content": content_html,
+        content_field: content_html,
     }
 
     # Add optional fields if provided
@@ -2498,6 +2499,41 @@ if "blocks" in st.session_state:
 
     if not api_token or not collection_id:
         st.warning("Enter your Webflow API token and Collection ID in the sidebar.")
+        target_field = "content"
+    else:
+        # Target-field selector — list all Rich Text fields in the collection
+        # so the user can pick where the HTML goes (default "content" if present).
+        schema_key = f"_schema_cache::{collection_id}"
+        if schema_key not in st.session_state:
+            with st.spinner("Loading collection schema..."):
+                _sch, _sch_err = fetch_collection_schema(api_token, collection_id)
+            st.session_state[schema_key] = _sch if not _sch_err else None
+            if _sch_err:
+                st.caption(f"⚠️ Could not load schema ({_sch_err}) — defaulting target to `content`.")
+
+        _sch = st.session_state.get(schema_key) or {}
+        _rt_fields = [f for f in _sch.get("fields", [])
+                      if str(f.get("type", "")).lower() == "richtext"]
+
+        if _rt_fields:
+            _slugs = [f.get("slug") for f in _rt_fields]
+            _labels = [f"{f.get('displayName', f.get('slug'))} ({f.get('slug')})"
+                       for f in _rt_fields]
+            _default = _slugs.index("content") if "content" in _slugs else 0
+            _pick = st.selectbox(
+                "🎯 Target Rich Text field",
+                options=list(range(len(_slugs))),
+                format_func=lambda i: _labels[i],
+                index=_default,
+                help="HTML will be pushed into this field. Defaults to `content` if it exists.",
+            )
+            target_field = _slugs[_pick]
+        else:
+            target_field = "content"
+            st.caption("No Rich Text fields found in schema — defaulting target to `content`.")
+
+    if not api_token or not collection_id:
+        pass  # already warned above
     elif mode == "Update Existing Item":
         found_item = st.session_state.get("found_item")
         if not found_item:
@@ -2508,7 +2544,7 @@ if "blocks" in st.session_state:
             target = "**LIVE**" if push_live else "**Draft (staged)**"
 
             # Build update payload with meta fields
-            update_fields = {"content": processed_html}
+            update_fields = {target_field: processed_html}
 
             # Check if meta fields were edited
             if "edit_name" in st.session_state and st.session_state["edit_name"] != found_item["fieldData"].get("name", ""):
@@ -2586,7 +2622,8 @@ if "blocks" in st.session_state:
             if confirm:
                 if st.button("🚀 Create Item", type="primary", use_container_width=True):
                     with st.spinner("Creating in Webflow..."):
-                        resp = create_new_item(api_token, new_name, new_slug, processed_html, collection_id, extra)
+                        resp = create_new_item(api_token, new_name, new_slug, processed_html,
+                                                collection_id, extra, content_field=target_field)
 
                     if resp.status_code in (200, 201, 202):
                         st.success("✅ Item created as Draft!")
