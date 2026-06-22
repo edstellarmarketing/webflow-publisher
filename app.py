@@ -2228,6 +2228,7 @@ upload_type = st.radio("📤 Upload Type", [
     "Webflow-Ready HTML (direct push)",
     "Raw HTML (auto-converts)",
     "CSV (pre-formatted)",
+    "Markdown (.md)",
 ], horizontal=True)
 
 if upload_type == "Webflow-Ready HTML (direct push)":
@@ -2310,7 +2311,7 @@ elif upload_type == "Raw HTML (auto-converts)":
                 }
                 st.rerun()
 
-else:  # CSV (pre-formatted)
+elif upload_type == "CSV (pre-formatted)":
     uploaded_csv = st.file_uploader("📄 Upload Content CSV", type=["csv"])
 
     if uploaded_csv:
@@ -2338,6 +2339,50 @@ else:  # CSV (pre-formatted)
             "warnings": [],
             "total_chars": len(csv_content),
         }
+
+else:  # Markdown (.md)
+    uploaded_md = st.file_uploader("📄 Upload Markdown file", type=["md"],
+                                    help="Plain Markdown article — converted to HTML blocks before push")
+
+    if uploaded_md:
+        import markdown as _md_lib
+        md_text = uploaded_md.read().decode("utf-8")
+        st.caption(f"Loaded **{uploaded_md.name}** — {len(md_text):,} characters")
+
+        md_html = _md_lib.markdown(
+            md_text,
+            extensions=["tables", "fenced_code", "nl2br"],
+        )
+
+        # Tag bare table/pre with a class so classify_and_wrap's existing
+        # rules (which require a class) treat them as embed blocks.
+        _md_soup = BeautifulSoup(md_html, "html.parser")
+        for _t in _md_soup.find_all("table"):
+            _t["class"] = _t.get("class", []) + ["md-table"]
+        for _p in _md_soup.find_all("pre"):
+            _wrap = _md_soup.new_tag("div")
+            _wrap["class"] = ["md-codeblock"]
+            _p.wrap(_wrap)
+        md_html = str(_md_soup)
+
+        # Run through the same Raw-HTML pipeline so tables / pre / sections
+        # get the data-rt-embed-type wrappers Webflow Rich Text requires.
+        with st.spinner("Converting Markdown → Webflow-ready HTML..."):
+            processed_html, stats = classify_and_wrap(md_html)
+
+        blocks_list = parse_blocks(processed_html)
+        st.session_state["blocks"] = blocks_list
+        st.session_state["processed_html"] = processed_html
+        st.session_state["stats"] = {
+            "total_blocks": len(blocks_list),
+            "embed_blocks": sum(1 for b in blocks_list if b["type"] == "embed"),
+            "plain_blocks": sum(1 for b in blocks_list if b["type"] == "plain"),
+            "warnings": stats.get("warnings", []),
+            "total_chars": len(processed_html),
+        }
+        st.success(f"✅ {len(blocks_list)} blocks converted from Markdown "
+                   f"({st.session_state['stats']['embed_blocks']} embeds, "
+                   f"{st.session_state['stats']['plain_blocks']} plain)")
 
 if "blocks" in st.session_state:
     blocks_list = st.session_state["blocks"]
