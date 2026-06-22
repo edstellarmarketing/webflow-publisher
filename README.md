@@ -39,7 +39,7 @@ Built-in support for:
 ## Quick start
 
 ```bash
-git clone https://github.com/Layruss98266/webflow-publisher.git
+git clone https://github.com/edstellarmarketing/webflow-publisher.git
 cd webflow-publisher
 pip install -r requirements.txt
 streamlit run app.py
