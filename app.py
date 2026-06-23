@@ -1398,6 +1398,95 @@ def push_items_bulk(api_token, collection_id, create_items, update_items, live=F
     return results
 
 
+def render_cms_fields_picker_inline(md_text, api_token, collection_id, key_prefix):
+    """Inline CMS-fields picker for Update Existing Item + Markdown (.md) mode.
+    Parses the .md, fetches schema (cached), resolves fields, renders the
+    tickbox picker, and returns the dict {slug: value} the user ticked.
+    Returns None if parsing or schema fetch fails (caller skips push)."""
+    parsed = parse_cms_fields_md(md_text)
+    if not parsed:
+        st.error("No fields found in the .md table.")
+        return None
+
+    schema_key = f"schema_{collection_id}"
+    if schema_key not in st.session_state:
+        with st.spinner("Loading collection schema…"):
+            schema, schema_err = fetch_collection_schema(api_token, collection_id)
+        if schema_err:
+            st.error(f"Failed to load schema: {schema_err}")
+            return None
+        st.session_state[schema_key] = schema
+    schema = st.session_state[schema_key]
+    field_map = schema["field_map"]
+
+    ref_cache = st.session_state.get(f"ref_cache_{collection_id}", {})
+    resolved_data, matches, warnings_list = resolve_md_to_field_data(
+        api_token, parsed, field_map, ref_cache
+    )
+    st.session_state[f"ref_cache_{collection_id}"] = ref_cache
+
+    st.success(f"📋 Parsed **{len(parsed)} fields** from CMS-fields .md — "
+               f"**{len(resolved_data)} matched** to collection schema.")
+
+    sel_c1, sel_c2 = st.columns(2)
+    with sel_c1:
+        if st.button("✅ Select all", key=f"{key_prefix}_select_all", use_container_width=True):
+            for _, rslug, _ in matches:
+                if rslug in resolved_data:
+                    st.session_state[f"{key_prefix}_pushfld_{rslug}"] = True
+    with sel_c2:
+        if st.button("⬜ Deselect all", key=f"{key_prefix}_deselect_all", use_container_width=True):
+            for _, rslug, _ in matches:
+                if rslug in resolved_data:
+                    st.session_state[f"{key_prefix}_pushfld_{rslug}"] = False
+
+    push_slugs = set()
+    skipped_count = sum(1 for _, s, _ in matches if not s)
+    with st.expander(f"📋 Field Mapping — tick fields to push "
+                     f"({len(matches) - skipped_count} matched / {skipped_count} unmatched)",
+                     expanded=True):
+        for entry, real_slug, default_skip in matches:
+            col_chk, col_a, col_b = st.columns([0.5, 1, 3])
+            with col_chk:
+                if real_slug and real_slug in resolved_data:
+                    chk_key = f"{key_prefix}_pushfld_{real_slug}"
+                    if chk_key not in st.session_state:
+                        # Update-mode default: identity/core fields OFF (DEFAULT_SKIP_FIELDS)
+                        st.session_state[chk_key] = not default_skip
+                    if st.checkbox("push", key=chk_key, label_visibility="collapsed"):
+                        push_slugs.add(real_slug)
+                else:
+                    st.caption("—")
+            with col_a:
+                if real_slug:
+                    schema_dn = field_map[real_slug].get("displayName", real_slug)
+                    label = f"**{entry['display_name']}**"
+                    if default_skip:
+                        label += " · _skip by default_"
+                    st.markdown(label)
+                    st.caption(f"→ `{real_slug}` · {entry['input_type']}")
+                    if _norm_name(schema_dn) != _norm_name(entry['display_name']):
+                        st.caption(f"matched via: *{schema_dn}*")
+                else:
+                    st.markdown(f"~~**{entry['display_name']}**~~")
+                    st.caption(f"⚠️ no schema match · {entry['input_type']}")
+            with col_b:
+                preview = entry["value"][:160].replace("\n", " ")
+                st.caption(preview + ("…" if len(entry["value"]) > 160 else ""))
+
+    field_data = {k: v for k, v in resolved_data.items() if k in push_slugs}
+    unmatched = [e["display_name"] for e, s, _ in matches if not s]
+    if unmatched:
+        st.warning(f"**Skipped {len(unmatched)} fields** (no schema match): "
+                   + ", ".join(f"_{u}_" for u in unmatched))
+    st.caption(f"**{len(field_data)} field(s) will be pushed.**")
+    if warnings_list:
+        with st.expander(f"⚠️ {len(warnings_list)} resolution warnings"):
+            for w in warnings_list:
+                st.caption(w)
+    return field_data
+
+
 # ─── STREAMLIT UI ─────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Edstellar → Webflow CMS Publisher", page_icon="🚀", layout="wide")
@@ -1523,6 +1612,7 @@ mode = st.radio(
     ["Update Existing Item", "Create New Item", "Push CMS Fields (.md)",
      "Bulk Push CMS Fields (.md, up to 5)"],
     horizontal=True,
+    key="mode_selector",
 )
 
 # Initialize variables for both modes
@@ -2343,7 +2433,13 @@ elif upload_type == "CSV (pre-formatted)":
 
 else:  # Markdown (.md)
     uploaded_md = st.file_uploader("📄 Upload Markdown file", type=["md"],
-                                    help="Plain Markdown article — converted to HTML blocks before push")
+                                    help="Plain Markdown article — converted to HTML blocks before push. "
+                                         "CMS-fields markdown is also detected and handled inline.")
+
+    if not uploaded_md:
+        # File removed → clear any prior inline CMS-fields state
+        for _k in ("_md_cms_mode", "_md_cms_field_data"):
+            st.session_state.pop(_k, None)
 
     if uploaded_md:
         import markdown as _md_lib
@@ -2356,48 +2452,123 @@ else:  # Markdown (.md)
             md_text, re.IGNORECASE
         )
         if _cms_fields_header:
-            st.error(
-                "⚠️ This looks like a **CMS-fields markdown file** "
-                "(contains a `Section | Field Name | Input Type` table). "
-                "Use the **Push CMS Fields (.md, up to 5)** mode in the sidebar instead — "
-                "this mode is for plain article markdown only."
+            # Inline path: Update Existing Item + item already loaded
+            if (mode == "Update Existing Item"
+                    and st.session_state.get("found_item")
+                    and api_token and collection_id):
+                st.info("🔀 Detected **CMS-fields markdown** — running the CMS-fields "
+                        "pipeline inline. Pick which fields to push below.")
+                _cms_field_data = render_cms_fields_picker_inline(
+                    md_text, api_token, collection_id,
+                    key_prefix=f"inline_md_{collection_id}",
+                )
+                if _cms_field_data is not None:
+                    st.session_state["_md_cms_mode"] = True
+                    st.session_state["_md_cms_field_data"] = _cms_field_data
+                # Drop any stale article-mode artifacts so the block UI is skipped
+                for _k in ("blocks", "processed_html", "stats"):
+                    st.session_state.pop(_k, None)
+
+                # ── Inline push UI (no block preview / target-field selector) ────
+                _found = st.session_state.get("found_item") or {}
+                _item_id = _found.get("id")
+                _item_name = _found.get("fieldData", {}).get("name", "?")
+                _target_lbl = "**LIVE**" if push_live else "**Draft (staged)**"
+                st.divider()
+                st.subheader("🚀 Push to Webflow CMS")
+                st.info(f"**Update:** {_item_name} → {_target_lbl}\n\n"
+                        f"Item ID: `{_item_id}` | "
+                        f"{len(_cms_field_data or {})} CMS field(s) selected")
+
+                if _cms_field_data:
+                    _confirm = st.checkbox(
+                        f"I confirm: update '{_item_name}' with selected CMS fields",
+                        key=f"_md_cms_confirm_{_item_id}",
+                    )
+                    if _confirm and st.button("🚀 Push Selected Fields",
+                                              type="primary", use_container_width=True,
+                                              key=f"_md_cms_push_{_item_id}"):
+                        with st.spinner("Pushing to Webflow..."):
+                            _url = (f"{WEBFLOW_API_BASE}/collections/{collection_id}/items/live"
+                                    if push_live else
+                                    f"{WEBFLOW_API_BASE}/collections/{collection_id}/items")
+                            _payload = {"items": [{"id": _item_id, "fieldData": _cms_field_data}]}
+                            _resp = requests.patch(_url, headers=get_headers(api_token),
+                                                   json=_payload, timeout=REQUEST_TIMEOUT)
+                        if _resp.status_code == 200:
+                            st.success("✅ Updated successfully!")
+                            st.balloons()
+                            with st.expander("API Response"):
+                                st.json(safe_json(_resp))
+                        else:
+                            st.error(f"❌ Failed — HTTP {_resp.status_code}")
+                            st.code(_resp.text, language="json")
+                else:
+                    st.caption("Tick at least one field above to enable the push button.")
+
+                st.stop()  # Skip the article-mode push UI entirely
+            else:
+                # No item loaded yet (or in Create / CMS-Fields mode) → ask user to switch
+                st.session_state.pop("_md_cms_mode", None)
+                st.session_state.pop("_md_cms_field_data", None)
+                st.error(
+                    "⚠️ This looks like a **CMS-fields markdown file** "
+                    "(contains a `Section | Field Name | Input Type` table). "
+                    "To push it inline, switch to **Update Existing Item** mode and "
+                    "find the target item via slug first — then re-upload here. "
+                    "Or use the dedicated CMS-fields modes below:"
+                )
+                _sw1, _sw2 = st.columns(2)
+                with _sw1:
+                    if st.button("➡️ Switch to Push CMS Fields (.md)",
+                                 type="primary", use_container_width=True):
+                        st.session_state["mode_selector"] = "Push CMS Fields (.md)"
+                        st.rerun()
+                with _sw2:
+                    if st.button("➡️ Switch to Bulk Push CMS Fields (.md, up to 5)",
+                                 use_container_width=True):
+                        st.session_state["mode_selector"] = "Bulk Push CMS Fields (.md, up to 5)"
+                        st.rerun()
+                st.stop()
+        else:
+            # Plain article markdown — run through the Raw-HTML pipeline
+            md_html = _md_lib.markdown(
+                md_text,
+                extensions=["tables", "fenced_code", "nl2br"],
             )
-            st.stop()
 
-        md_html = _md_lib.markdown(
-            md_text,
-            extensions=["tables", "fenced_code", "nl2br"],
-        )
+            # Tag bare table/pre with a class so classify_and_wrap's existing
+            # rules (which require a class) treat them as embed blocks.
+            _md_soup = BeautifulSoup(md_html, "html.parser")
+            for _t in _md_soup.find_all("table"):
+                _t["class"] = _t.get("class", []) + ["md-table"]
+            for _p in _md_soup.find_all("pre"):
+                _wrap = _md_soup.new_tag("div")
+                _wrap["class"] = ["md-codeblock"]
+                _p.wrap(_wrap)
+            md_html = str(_md_soup)
 
-        # Tag bare table/pre with a class so classify_and_wrap's existing
-        # rules (which require a class) treat them as embed blocks.
-        _md_soup = BeautifulSoup(md_html, "html.parser")
-        for _t in _md_soup.find_all("table"):
-            _t["class"] = _t.get("class", []) + ["md-table"]
-        for _p in _md_soup.find_all("pre"):
-            _wrap = _md_soup.new_tag("div")
-            _wrap["class"] = ["md-codeblock"]
-            _p.wrap(_wrap)
-        md_html = str(_md_soup)
+            # Run through the same Raw-HTML pipeline so tables / pre / sections
+            # get the data-rt-embed-type wrappers Webflow Rich Text requires.
+            with st.spinner("Converting Markdown → Webflow-ready HTML..."):
+                processed_html, stats = classify_and_wrap(md_html)
 
-        # Run through the same Raw-HTML pipeline so tables / pre / sections
-        # get the data-rt-embed-type wrappers Webflow Rich Text requires.
-        with st.spinner("Converting Markdown → Webflow-ready HTML..."):
-            processed_html, stats = classify_and_wrap(md_html)
-
-        blocks_list = parse_blocks(processed_html)
-        st.session_state["blocks"] = blocks_list
-        st.session_state["processed_html"] = processed_html
-        st.session_state["stats"] = {
-            "total_blocks": len(blocks_list),
-            "embed_blocks": sum(1 for b in blocks_list if b["type"] == "embed"),
-            "plain_blocks": sum(1 for b in blocks_list if b["type"] == "plain"),
-            "warnings": stats.get("warnings", []),
-            "total_chars": len(processed_html),
-        }
-        st.success(f"✅ {len(blocks_list)} blocks converted from Markdown "
-                   f"({st.session_state['stats']['embed_blocks']} embeds, "
-                   f"{st.session_state['stats']['plain_blocks']} plain)")
+            blocks_list = parse_blocks(processed_html)
+            st.session_state["blocks"] = blocks_list
+            st.session_state["processed_html"] = processed_html
+            st.session_state["stats"] = {
+                "total_blocks": len(blocks_list),
+                "embed_blocks": sum(1 for b in blocks_list if b["type"] == "embed"),
+                "plain_blocks": sum(1 for b in blocks_list if b["type"] == "plain"),
+                "warnings": stats.get("warnings", []),
+                "total_chars": len(processed_html),
+            }
+            # Clear any stale CMS-fields state since this is an article-mode push
+            for _k in ("_md_cms_mode", "_md_cms_field_data"):
+                st.session_state.pop(_k, None)
+            st.success(f"✅ {len(blocks_list)} blocks converted from Markdown "
+                       f"({st.session_state['stats']['embed_blocks']} embeds, "
+                       f"{st.session_state['stats']['plain_blocks']} plain)")
 
 if "blocks" in st.session_state:
     blocks_list = st.session_state["blocks"]
